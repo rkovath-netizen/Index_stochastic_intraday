@@ -2,6 +2,44 @@ import streamlit as st
 import pandas as pd
 import datetime
 
+from github import Github
+import streamlit as st
+
+def push_csv_to_github(csv_string, filename):
+    """Pushes a CSV string directly to the GitHub repository."""
+    try:
+        # Pull token from secrets
+        github_token = st.secrets["GITHUB_TOKEN"]
+        
+        # Initialize GitHub client
+        g = Github(github_token)
+        
+        # Replace with your actual GitHub username and repository name
+        repo = g.get_repo("your_username/index_stochastic_intraday")
+        
+        # Create the file in the repository
+        repo.create_file(
+            path=filename, 
+            message=f"Auto-generated backtest results: {filename}", 
+            content=csv_string, 
+            branch="main" # Ensure this matches your default branch
+        )
+        return True
+    except Exception as e:
+        st.error(f"Failed to save to GitHub: {e}")
+        return False
+# Assuming csv_trades is your converted dataframe
+csv_string = all_trades.to_csv(index=False)
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+filename = f"backtest_results/trades_{timestamp}.csv"
+
+if st.button("💾 Save Results to GitHub"):
+    with st.spinner("Pushing to GitHub repository..."):
+        success = push_csv_to_github(csv_string, filename)
+        if success:
+            st.success(f"Successfully saved {filename} to GitHub!")
+
+
 # Import modular functions from your backtest engine
 from backtest_engine import (
     INSTRUMENTS, TIMEFRAME_COMBOS, fetch_historical_1m_data,
