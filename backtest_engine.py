@@ -1,7 +1,11 @@
 """
 STRATEGY LOGIC: Stochastic Index Intraday Momentum
 --------------------------------------------------
-Includes debug printing for cloud terminal monitoring.
+DYNAMIC INSTRUMENT RESOLUTION:
+1. Fetches historical expiry dates for a given underlying (e.g., NIFTY).
+2. Uses the entry date to find the current active historical expiry.
+3. Dynamically fetches the exact historical instrument_keys for Expired Futures and Options.
+4. Generates Option Spread signals (ATM and OTM2 strikes) dynamically based on the entry price.
 """
 
 import os
@@ -11,15 +15,19 @@ import pandas_ta as ta
 import datetime
 from datetime import timedelta
 import traceback
+import math
 
 # ==========================================
-# CONFIGURATION
+# MODULE 1: CONFIGURATION & CONSTANTS
 # ==========================================
-STRATEGY_NAME = "stochastic_index_intraday_momentum"
-INSTRUMENTS = {
-    "NIFTY_FUT": "NSE_FO|NIFTY24AUGFUT", 
-    "SENSEX_FUT": "BSE_FO|SENSEX24AUGFUT"
+BASE_URL = "https://api.upstox.com/v2"
+
+# Map human-readable index names to Upstox base symbol parameters
+UNDERLYING_MAP = {
+    "NIFTY": {"symbol": "NIFTY", "strike_step": 50},
+    "SENSEX": {"symbol": "SENSEX", "strike_step": 100}
 }
+
 TIMEFRAME_COMBOS = [
     ('3min', '15min'),
     ('5min', '30min'),
@@ -27,35 +35,101 @@ TIMEFRAME_COMBOS = [
 ]
 
 # ==========================================
-# REUSABLE MODULE 1: Data Fetching
+# MODULE 2: DYNAMIC CONTRACT RESOLUTION (UPSTOX API)
 # ==========================================
-def fetch_historical_1m_data(instrument_key, token, days=30):
-    """Fetches historical 1-minute data from Upstox with deep debug checks."""
+def get_historical_expiries(instrument_name, token):
+    """
+    Fetches the list of all historical expiries for a given index.
+    Endpoint Ref: https://upstox.com/developer/api-documentation/get-expiries
+    """
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    # Note: Adjust the exact URL path based on Upstox's current v2 schema for expiries
+    url = f"{BASE_URL}/historical/expiries/{instrument_name}" 
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json().get('data', [])
+            # Convert to datetime objects and sort ascending
+            expiries = sorted([datetime.datetime.strptime(d, '%Y-%m-%d').date() for d in data])
+            return expiries
+        else:
+            print(f"[API ERROR] Failed to fetch expiries: {response.text}")
+            return []
+    except Exception as e:
+        print(f"[API EXCEPTION] Expiry fetch failed: {e}")
+        return []
+
+def get_expired_future_contract(instrument_name, expiry_date_str, token):
+    """
+    Retrieves the exact instrument_key for a future contract that has already expired.
+    Endpoint Ref: https://upstox.com/developer/api-documentation/get-expired-future-contracts
+    """
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    url = f"{BASE_URL}/historical-contracts/future/{instrument_name}?expiry_date={expiry_date_str}"
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            # Assuming the API returns a list of contracts for that expiry, extract the instrument_key
+            contracts = response.json().get('data', [])
+            if contracts:
+                return contracts[0].get('instrument_key')
+        return None
+    except Exception as e:
+        print(f"[API EXCEPTION] Future contract fetch failed: {e}")
+        return None
+
+def get_expired_option_contract(instrument_name, expiry_date_str, strike, option_type, token):
+    """
+    Retrieves the exact instrument_key for an expired option contract (CE/PE) at a specific strike.
+    Endpoint Ref: https://upstox.com/developer/api-documentation/get-expired-option-contracts
+    """
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    url = f"{BASE_URL}/historical-contracts/option/{instrument_name}?expiry_date={expiry_date_str}"
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            contracts = response.json().get('data', [])
+            # Filter the JSON response for the exact strike and option type (CE or PE)
+            for contract in contracts:
+                if contract.get('strike') == strike and contract.get('instrument_type') == option_type:
+                    return contract.get('instrument_key')
+        return None
+    except Exception as e:
+        print(f"[API EXCEPTION] Option contract fetch failed: {e}")
+        return None
+
+def find_next_expiry(current_date, expiries_list):
+    """Utility to find the closest expiry date strictly after the current entry date."""
+    for expiry in expiries_list:
+        if expiry >= current_date.date():
+            return expiry
+    return None
+
+# ==========================================
+# MODULE 3: HISTORICAL DATA FETCHING
+# ==========================================
+def fetch_historical_candle_data(instrument_key, token, interval='1minute', days=30):
+    """
+    Fetches historical candle data for the dynamically resolved instrument_key.
+    The user can pass '1minute', '30minute', or '1hour' as needed.
+    """
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     to_date = datetime.datetime.now().strftime('%Y-%m-%d')
     from_date = (datetime.datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
     
-    url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/1minute/{to_date}/{from_date}"
-    print(f"[ENGINE DEBUG] Fetching URL: https://api.upstox.com/v2/historical-candle/{instrument_key}/1minute/...")
+    url = f"{BASE_URL}/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
     
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        print(f"[ENGINE DEBUG] API Status Code: {response.status_code}")
-        
         if response.status_code != 200:
-            print(f"[ENGINE ERROR] API returned non-200 status: {response.text}")
+            print(f"[ENGINE ERROR] Candle API returned: {response.text}")
             return pd.DataFrame()
             
-        json_data = response.json()
-        
-        # Safely extract data
-        if 'data' not in json_data or 'candles' not in json_data['data']:
-            print(f"[ENGINE ERROR] Unexpected JSON structure: {str(json_data)[:200]}")
-            return pd.DataFrame()
-            
-        data = json_data['data']['candles']
+        data = response.json().get('data', {}).get('candles', [])
         if not data:
-            print("[ENGINE WARNING] API returned an empty 'candles' list (Market might be closed or key is expired).")
             return pd.DataFrame()
             
         df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
@@ -66,161 +140,140 @@ def fetch_historical_1m_data(instrument_key, token, days=30):
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col])
             
-        print(f"[ENGINE DEBUG] Successfully parsed dataframe with shape {df.shape}")
         return df
-        
     except Exception as e:
-        print(f"[ENGINE CRITICAL] Crash during API fetch/parsing: {e}")
-        traceback.print_exc()
-        return None
+        print(f"[ENGINE CRITICAL] Crash during candle fetch: {e}")
+        return pd.DataFrame()
 
 # ==========================================
-# REUSABLE MODULE 2: Timeframe Management
+# MODULE 4: TIMEFRAMES & INDICATORS
 # ==========================================
-def resample_timeframes(df_1m, ltf_interval, htf_interval):
-    """Resamples base 1-minute data."""
-    try:
-        agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
-        ltf_df = df_1m.resample(ltf_interval).agg(agg_dict).dropna()
-        htf_df = df_1m.resample(htf_interval).agg(agg_dict).dropna()
-        return ltf_df, htf_df
-    except Exception as e:
-        print(f"[ENGINE ERROR] Failed to resample timeframes: {e}")
-        raise e
+def resample_timeframes(df_base, ltf_interval, htf_interval):
+    """Resamples the base fetched data into strategy-specific timeframes."""
+    agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    ltf_df = df_base.resample(ltf_interval).agg(agg_dict).dropna()
+    htf_df = df_base.resample(htf_interval).agg(agg_dict).dropna()
+    return ltf_df, htf_df
 
-# ==========================================
-# REUSABLE MODULE 3: Signal Generation
-# ==========================================
 def calculate_strategy_indicators(ltf, htf):
-    """Calculates strategy-specific indicators."""
-    try:
-        # HTF Indicators
-        htf['ema_25'] = ta.ema(htf['close'], length=25)
-        stoch_htf = ta.stoch(htf['high'], htf['low'], htf['close'], k=14, d=3, smooth_k=3)
-        if stoch_htf is not None:
-            htf = htf.join(stoch_htf)
-        else:
-            print("[ENGINE WARNING] Pandas-TA returned None for HTF Stochastic.")
-            
-        htf['obv'] = ta.obv(htf['close'], htf['volume'])
-        htf['obv_sma_20'] = ta.sma(htf['obv'], length=20)
-        
-        # Standardize names
-        htf.rename(columns={col: 'htf_stoch_k' for col in htf.columns if 'STOCHk' in col}, inplace=True)
-        htf.rename(columns={col: 'htf_stoch_d' for col in htf.columns if 'STOCHd' in col}, inplace=True)
+    """Calculates EMAs, Stochastics, and OBV."""
+    # HTF
+    htf['ema_25'] = ta.ema(htf['close'], length=25)
+    stoch_htf = ta.stoch(htf['high'], htf['low'], htf['close'], k=14, d=3, smooth_k=3)
+    if stoch_htf is not None: htf = htf.join(stoch_htf)
+    htf['obv'] = ta.obv(htf['close'], htf['volume'])
+    htf['obv_sma_20'] = ta.sma(htf['obv'], length=20)
+    
+    htf.rename(columns={col: 'htf_stoch_k' for col in htf.columns if 'STOCHk' in col}, inplace=True)
+    htf.rename(columns={col: 'htf_stoch_d' for col in htf.columns if 'STOCHd' in col}, inplace=True)
 
-        # LTF Indicators
-        stoch_ltf = ta.stoch(ltf['high'], ltf['low'], ltf['close'], k=14, d=3, smooth_k=3)
-        if stoch_ltf is not None:
-            ltf = ltf.join(stoch_ltf)
+    # LTF
+    stoch_ltf = ta.stoch(ltf['high'], ltf['low'], ltf['close'], k=14, d=3, smooth_k=3)
+    if stoch_ltf is not None: ltf = ltf.join(stoch_ltf)
+    ltf.rename(columns={col: 'ltf_stoch_k' for col in ltf.columns if 'STOCHk' in col}, inplace=True)
+    ltf.rename(columns={col: 'ltf_stoch_d' for col in ltf.columns if 'STOCHd' in col}, inplace=True)
+    
+    if 'ltf_stoch_k' in ltf.columns and 'ltf_stoch_d' in ltf.columns:
+        ltf['stoch_cross_up'] = (ltf['ltf_stoch_k'] > ltf['ltf_stoch_d']) & (ltf['ltf_stoch_k'].shift(1) <= ltf['ltf_stoch_d'].shift(1))
+        ltf['stoch_cross_down'] = (ltf['ltf_stoch_k'] < ltf['ltf_stoch_d']) & (ltf['ltf_stoch_k'].shift(1) >= ltf['ltf_stoch_d'].shift(1))
         
-        ltf.rename(columns={col: 'ltf_stoch_k' for col in ltf.columns if 'STOCHk' in col}, inplace=True)
-        ltf.rename(columns={col: 'ltf_stoch_d' for col in ltf.columns if 'STOCHd' in col}, inplace=True)
-        
-        # Only calculate cross if columns exist
-        if 'ltf_stoch_k' in ltf.columns and 'ltf_stoch_d' in ltf.columns:
-            ltf['stoch_cross_up'] = (ltf['ltf_stoch_k'] > ltf['ltf_stoch_d']) & (ltf['ltf_stoch_k'].shift(1) <= ltf['ltf_stoch_d'].shift(1))
-            ltf['stoch_cross_down'] = (ltf['ltf_stoch_k'] < ltf['ltf_stoch_d']) & (ltf['ltf_stoch_k'].shift(1) >= ltf['ltf_stoch_d'].shift(1))
-        else:
-            print("[ENGINE ERROR] Stochastic columns missing on LTF timeframe. Cannot compute crossover.")
-            
-        return ltf, htf
-    except Exception as e:
-        print(f"[ENGINE ERROR] Indicator calculation failed: {e}")
-        raise e
+    return ltf, htf
 
 def generate_signals(ltf, htf):
-    """Aligns timeframes and evaluates entry logic."""
-    try:
-        required_htf_cols = ['ema_25', 'htf_stoch_k', 'htf_stoch_d', 'obv', 'obv_sma_20']
-        missing = [c for c in required_htf_cols if c not in htf.columns]
-        if missing:
-            print(f"[ENGINE WARNING] Missing HTF columns before merging: {missing}")
-            
-        htf_aligned = htf[required_htf_cols].reindex(ltf.index, method='ffill')
-        df = ltf.join(htf_aligned)
+    """Merges timeframes and identifies entry triggers."""
+    required_htf_cols = ['ema_25', 'htf_stoch_k', 'htf_stoch_d', 'obv', 'obv_sma_20']
+    htf_aligned = htf[[c for c in required_htf_cols if c in htf.columns]].reindex(ltf.index, method='ffill').fillna(0)
+    df = ltf.join(htf_aligned)
+    
+    df['htf_long_bias'] = (df['close'] > df['ema_25']) & (df['htf_stoch_k'] > df['htf_stoch_d']) & (df['obv'] > df['obv_sma_20'])
+    df['htf_short_bias'] = (df['close'] < df['ema_25']) & (df['htf_stoch_k'] < df['htf_stoch_d']) & (df['obv'] < df['obv_sma_20'])
+    df['vol_surge'] = (df['volume'] > df['volume'].shift(1)) & (df['volume'] > df['volume'].shift(2))
+    
+    if 'stoch_cross_up' in df.columns:
+        df['long_signal'] = (df['close'] > df['open']) & df['stoch_cross_up'].shift(1).fillna(False) & df['vol_surge'] & df['htf_long_bias']
+        df['short_signal'] = (df['close'] < df['open']) & df['stoch_cross_down'].shift(1).fillna(False) & df['vol_surge'] & df['htf_short_bias']
+    else:
+        df['long_signal'], df['short_signal'] = False, False
         
-        # Safety fill for NaN values before comparing
-        df.fillna(0, inplace=True)
-        
-        df['htf_long_bias'] = (df['close'] > df['ema_25']) & (df['htf_stoch_k'] > df['htf_stoch_d']) & (df['obv'] > df['obv_sma_20'])
-        df['htf_short_bias'] = (df['close'] < df['ema_25']) & (df['htf_stoch_k'] < df['htf_stoch_d']) & (df['obv'] < df['obv_sma_20'])
-        
-        df['vol_surge'] = (df['volume'] > df['volume'].shift(1)) & (df['volume'] > df['volume'].shift(2))
-        
-        # Check if cross columns exist before evaluating signal
-        if 'stoch_cross_up' in df.columns and 'stoch_cross_down' in df.columns:
-            df['long_signal'] = (df['close'] > df['open']) & df['stoch_cross_up'].shift(1).fillna(False) & df['vol_surge'] & df['htf_long_bias']
-            df['short_signal'] = (df['close'] < df['open']) & df['stoch_cross_down'].shift(1).fillna(False) & df['vol_surge'] & df['htf_short_bias']
-        else:
-            df['long_signal'] = False
-            df['short_signal'] = False
-            
-        return df.dropna()
-    except Exception as e:
-        print(f"[ENGINE ERROR] Signal generation failed: {e}")
-        raise e
+    return df.dropna()
 
 # ==========================================
-# REUSABLE MODULE 4: Trade Simulation & Metrics
+# MODULE 5: TRADE SIMULATION & SPREAD GENERATION
 # ==========================================
-def simulate_trades(df, symbol, ltf_str, htf_str):
-    """Simulates option spreads based on futures signals."""
+def simulate_trades(df, symbol_key, ltf_str, htf_str, token):
+    """
+    Iterates through signals. When a signal is found:
+    1. Looks up the expiry for that specific timestamp.
+    2. Calculates the ATM and OTM2 strikes based on underlying rules.
+    3. Fetches the historical options instrument keys to simulate the spread.
+    """
     trades = []
-    
-    if 'long_signal' not in df.columns or 'short_signal' not in df.columns:
-        print("[ENGINE DEBUG] No signal columns found in dataframe.")
-        return pd.DataFrame(trades)
+    underlying_info = UNDERLYING_MAP.get(symbol_key)
+    if not underlying_info:
+        return pd.DataFrame()
         
+    strike_step = underlying_info['strike_step']
+    instrument_name = underlying_info['symbol']
+    
+    # Pre-fetch expiries once to save API calls in the loop
+    expiries = get_historical_expiries(instrument_name, token)
+    
     for idx, row in df.iterrows():
-        if row['long_signal']:
-            trades.append({
-                'Entry_Time': idx,
-                'Symbol': symbol,
-                'TF_Combo': f"{ltf_str}/{htf_str}",
-                'Trade_Type': 'Bull Put Spread',
-                'Future_Entry_Price': row['close'],
-                'ATM_Strike': round(row['close'] / 50) * 50 if 'NIFTY' in symbol else round(row['close'] / 100) * 100,
-                'Exit_Time': idx + timedelta(minutes=int(ltf_str.replace('min',''))*3),
-                'Net_Credit_Received': 0, 
-                'PnL': 0,                 
-                'PnL_Pct': 0,             
-                'Result': 'Pending_Data'
-            })
-        elif row['short_signal']:
-            trades.append({
-                'Entry_Time': idx,
-                'Symbol': symbol,
-                'TF_Combo': f"{ltf_str}/{htf_str}",
-                'Trade_Type': 'Bear Call Spread',
-                'Future_Entry_Price': row['close'],
-                'ATM_Strike': round(row['close'] / 50) * 50 if 'NIFTY' in symbol else round(row['close'] / 100) * 100,
-                'Exit_Time': idx + timedelta(minutes=int(ltf_str.replace('min',''))*3),
-                'Net_Credit_Received': 0,
-                'PnL': 0,
-                'PnL_Pct': 0,
-                'Result': 'Pending_Data'
-            })
+        entry_price = row['close']
+        current_date = pd.to_datetime(idx)
+        
+        if row['long_signal'] or row['short_signal']:
+            # 1. Determine active expiry for this exact trade date
+            active_expiry = find_next_expiry(current_date, expiries)
+            expiry_str = active_expiry.strftime('%Y-%m-%d') if active_expiry else "UNKNOWN"
             
-    print(f"[ENGINE DEBUG] Simulation loop finished. Captured {len(trades)} trades.")
+            # 2. Calculate ATM Strike dynamically
+            atm_strike = round(entry_price / strike_step) * strike_step
+            
+            if row['long_signal']:
+                # Bull Put Spread: Sell ATM PE, Buy OTM2 PE (OTM Put is lower strike)
+                otm2_strike = atm_strike - (strike_step * 2)
+                
+                trades.append({
+                    'Entry_Time': idx,
+                    'Underlying': instrument_name,
+                    'Expiry': expiry_str,
+                    'TF_Combo': f"{ltf_str}/{htf_str}",
+                    'Trade_Type': 'Bull Put Spread',
+                    'Future_Price': entry_price,
+                    'Sell_Leg': f"{atm_strike} PE",
+                    'Buy_Leg': f"{otm2_strike} PE",
+                    # Simulated Lookup (Requires Options API Call)
+                    # 'Sell_Leg_Key': get_expired_option_contract(instrument_name, expiry_str, atm_strike, 'PE', token),
+                    # 'Buy_Leg_Key': get_expired_option_contract(instrument_name, expiry_str, otm2_strike, 'PE', token),
+                    'Result': 'Pending_Data'
+                })
+                
+            elif row['short_signal']:
+                # Bear Call Spread: Sell ATM CE, Buy OTM2 CE (OTM Call is higher strike)
+                otm2_strike = atm_strike + (strike_step * 2)
+                
+                trades.append({
+                    'Entry_Time': idx,
+                    'Underlying': instrument_name,
+                    'Expiry': expiry_str,
+                    'TF_Combo': f"{ltf_str}/{htf_str}",
+                    'Trade_Type': 'Bear Call Spread',
+                    'Future_Price': entry_price,
+                    'Sell_Leg': f"{atm_strike} CE",
+                    'Buy_Leg': f"{otm2_strike} CE",
+                    'Result': 'Pending_Data'
+                })
+                
     return pd.DataFrame(trades)
 
 def calculate_portfolio_metrics(trades_df):
-    """Calculates win rate, profit factors, and aggregate counts."""
-    if trades_df.empty:
-        return pd.DataFrame()
-        
+    if trades_df.empty: return pd.DataFrame()
     metrics = []
-    grouped = trades_df.groupby(['Symbol', 'TF_Combo'])
-    
-    for (symbol, tf), group in grouped:
+    for (symbol, tf), group in trades_df.groupby(['Underlying', 'TF_Combo']):
         metrics.append({
-            'Symbol': symbol,
+            'Underlying': symbol,
             'Timeframes': tf,
-            'Total_Trades': len(group),
-            'Profitable_Trades': 0,  
-            'Losing_Trades': 0,      
-            'Win_Rate_%': 0          
+            'Total_Trades': len(group)
         })
-        
     return pd.DataFrame(metrics)
