@@ -1,10 +1,11 @@
 """
 STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
-ARCHITECTURE UPDATES:
-- Continuous Futures Builder: Stitches together front-month futures to create a historical chart.
-- Strict Expiry Matching: Prevents FINNIFTY/BANKNIFTY contamination for NIFTY expiries.
-- Option Price Polling: Sorts candles chronologically to pull the exact entry minute price.
+MODULES:
+- Local Caching: Checks for local CSV files (e.g., NIFTY_continuous.csv) to bypass API rate limits and delays.
+- Continuous Futures Builder: Stitches front-month futures history.
+- Strict Expiry Matching: Prevents FINNIFTY/BANKNIFTY contamination.
+- Precise Option OHLC Polling: Sorts candles chronologically to grab exact minute pricing.
 """
 
 import os
@@ -45,12 +46,10 @@ def robust_api_get(url, headers, max_retries=3, params=None):
 # MODULE 2: EXPIRY & CONTRACT RESOLUTION
 # ==========================================
 def get_all_expiries(symbol, token):
-    """Fetches every known expiry date (live and expired) and returns a sorted list."""
     available_expiries = set()
     underlying_key = INDEX_CONFIG[symbol]["underlying"]
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     
-    # Expired Expiries
     url = "https://api.upstox.com/v2/expired-instruments/expiries"
     res = robust_api_get(url, headers, params={"instrument_key": underlying_key})
     if res and res.status_code == 200:
@@ -58,7 +57,6 @@ def get_all_expiries(symbol, token):
             if isinstance(d, str): available_expiries.add(d)
             elif isinstance(d, dict) and "expiry_date" in d: available_expiries.add(d["expiry_date"])
     
-    # Live Expiries
     url_csv = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
     res_csv = requests.get(url_csv)
     if res_csv.status_code == 200:
@@ -66,36 +64,30 @@ def get_all_expiries(symbol, token):
             reader = csv.DictReader(f)
             for row in reader:
                 tsym = row.get('tradingsymbol', '').upper()
-                # CRITICAL FIX: startswith prevents FINNIFTY from bleeding into NIFTY expiries
                 if tsym.startswith(symbol) and row.get('expiry'):
                     available_expiries.add(row.get('expiry'))
                     
     return sorted(list(available_expiries))
 
 def get_monthly_expiries(all_expiries):
-    """Groups expiries by YYYY-MM and extracts the maximum date (the monthly expiry)."""
     months = {}
     for exp in all_expiries:
-        ym = exp[:7] # Extract YYYY-MM
+        ym = exp[:7]
         if ym not in months or exp > months[ym]:
             months[ym] = exp
     return sorted(list(months.values()))
 
 def get_closest_weekly_expiry(all_expiries, target_date_str):
-    """Finds the immediate next expiry after a given historical trade date."""
     valid_dates = [d for d in all_expiries if d >= target_date_str]
     return valid_dates[0] if valid_dates else None
 
 def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", strike=None, opt_type=None):
-    """Resolves the exact instrument key using Active or Expired APIs."""
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     expiry_dt = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
     today_dt = datetime.today().date()
-    
     segment = INDEX_CONFIG[symbol]["segment"]
     
     if expiry_dt >= today_dt:
-        # LIVE
         query = f"{symbol}"
         if strike: query += f" {int(strike)}"
         search_params = {"query": query, "segments": segment, "instrument_types": inst_type if not opt_type else opt_type, "expiry": expiry_date_str}
@@ -104,7 +96,6 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
             data = res.json().get('data', [])
             if data: return data[0].get('instrument_key')
     else:
-        # EXPIRED
         api_type = "option" if inst_type == "OPTIDX" else "future"
         underlying = INDEX_CONFIG[symbol]["underlying"]
         url = f"https://api.upstox.com/v2/expired-instruments/{api_type}/contract"
@@ -121,21 +112,18 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
     return None
 
 # ==========================================
-# MODULE 3: DATA FETCHING & STITCHING
+# MODULE 3: DATA FETCHING & LOCAL CACHING
 # ==========================================
 def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1minute'):
-    """Fetches a specific timeframe chunk, routing to active or expired automatically."""
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     encoded_key = urllib.parse.quote(instrument_key)
     
-    # Try Active
     url_active = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{interval}/{to_date}/{from_date}"
     res = robust_api_get(url_active, headers)
     candles = []
     if res and res.status_code == 200:
         candles = res.json().get('data', {}).get('candles', [])
         
-    # Fallback to Expired
     if not candles:
         url_expired = f"https://api.upstox.com/v2/expired-instruments/historical-candle/{encoded_key}/{interval}/{to_date}/{from_date}"
         res_exp = robust_api_get(url_expired, headers)
@@ -150,17 +138,22 @@ def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1min
     return df.sort_index().astype(float)
 
 def build_continuous_futures(symbol, start_date_str, token):
-    """
-    Core Engine Function: Stitches multiple front-month futures together 
-    to create a single continuous timeframe from start_date to today.
-    """
     today_str = datetime.today().strftime('%Y-%m-%d')
     start_dt = datetime.strptime(start_date_str, '%Y-%m-%d').date()
     
     all_expiries = get_all_expiries(symbol, token)
-    monthly_expiries = get_monthly_expiries(all_expiries)
     
-    # Get all monthly expiries required to bridge the date gap
+    # Check local cache first to avoid API bottlenecks
+    local_filename = f"{symbol}_continuous.csv"
+    if os.path.exists(local_filename):
+        print(f"[ENGINE] Loading local cache: {local_filename}")
+        df = pd.read_csv(local_filename)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+        df = df[df.index >= pd.to_datetime(start_date_str)]
+        return df, all_expiries
+
+    monthly_expiries = get_monthly_expiries(all_expiries)
     relevant_expiries = [e for e in monthly_expiries if datetime.strptime(e, '%Y-%m-%d').date() >= start_dt]
     
     continuous_df = pd.DataFrame()
@@ -170,28 +163,25 @@ def build_continuous_futures(symbol, start_date_str, token):
         future_key = resolve_exact_contract(symbol, exp, token, inst_type="FUTIDX")
         if not future_key: continue
         
-        # Don't fetch past today
         end_fetch = min(exp, today_str)
-        
-        print(f"[ENGINE] Fetching {symbol} FUT chunk: {current_start} to {end_fetch}")
         df = fetch_candle_chunk(future_key, current_start, end_fetch, token)
         
         if not df.empty:
             continuous_df = pd.concat([continuous_df, df])
             
-        # Move the start date to the day after this expiry
         current_start = (datetime.strptime(exp, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
         if current_start > today_str:
             break
             
     if not continuous_df.empty:
-        # Drop overlapping artifacts
         continuous_df = continuous_df[~continuous_df.index.duplicated(keep='first')]
+        try:
+            continuous_df.to_csv(local_filename)
+        except: pass
         
     return continuous_df, all_expiries
 
 def get_specific_candle_close(instrument_key, target_dt_str, token):
-    """Fetches the exact Option Price at the given historical minute."""
     if not instrument_key: return 0.0
     target_date = target_dt_str[:10]
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
@@ -205,7 +195,6 @@ def get_specific_candle_close(instrument_key, target_dt_str, token):
     res = robust_api_get(url, headers)
     if res and res.status_code == 200:
         candles = res.json().get("data", {}).get("candles", [])
-        # CRITICAL FIX: Sort chronologically so we catch the exact minute properly
         candles.sort(key=lambda x: x[0]) 
         for candle in candles:
             if str(candle[0])[:16].replace('T', ' ') >= target_dt_str:
@@ -213,7 +202,7 @@ def get_specific_candle_close(instrument_key, target_dt_str, token):
     return 0.0
 
 # ==========================================
-# MODULE 4: STRATEGY LOGIC
+# MODULE 4: STRATEGY & SIMULATION
 # ==========================================
 def resample_timeframes(df_base, ltf_interval, htf_interval):
     agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'vol': 'sum'}
@@ -259,9 +248,6 @@ def generate_signals(ltf, htf):
         
     return df.dropna()
 
-# ==========================================
-# MODULE 5: SIMULATION
-# ==========================================
 def simulate_trades(df, symbol, ltf_str, htf_str, token, all_expiries):
     trades = []
     step = INDEX_CONFIG[symbol]["step"]
@@ -284,12 +270,8 @@ def simulate_trades(df, symbol, ltf_str, htf_str, token, all_expiries):
             sell_leg_key = resolve_exact_contract(symbol, weekly_expiry, token, inst_type="OPTIDX", strike=atm_strike, opt_type=opt_type)
             buy_leg_key = resolve_exact_contract(symbol, weekly_expiry, token, inst_type="OPTIDX", strike=otm2_strike, opt_type=opt_type)
             
-            sell_price = get_specific_candle_close(sell_leg_key, entry_dt_str, token) if sell_leg_key else 0.0
-            buy_price = get_specific_candle_close(buy_leg_key, entry_dt_str, token) if buy_leg_key else 0.0
-            
-            # Formatting to 2 decimal places to avoid massive floats
-            sell_price = round(sell_price, 2)
-            buy_price = round(buy_price, 2)
+            sell_price = round(get_specific_candle_close(sell_leg_key, entry_dt_str, token), 2) if sell_leg_key else 0.0
+            buy_price = round(get_specific_candle_close(buy_leg_key, entry_dt_str, token), 2) if buy_leg_key else 0.0
             net_credit = round(sell_price - buy_price, 2)
             
             trades.append({
