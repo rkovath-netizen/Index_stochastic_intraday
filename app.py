@@ -22,7 +22,6 @@ def push_csv_to_github(csv_string, filename, repo_path):
     try:
         github_token = st.secrets.get("GITHUB_TOKEN", "")
         if not github_token:
-            st.error("GitHub Token not found in Streamlit Secrets.")
             return False
             
         g = Github(github_token)
@@ -36,7 +35,7 @@ def push_csv_to_github(csv_string, filename, repo_path):
         )
         return True
     except Exception as e:
-        st.error(f"Failed to save to GitHub: {e}")
+        print(f"Failed to auto-save to GitHub: {e}")
         return False
 
 # --- UI INITIALIZATION ---
@@ -125,7 +124,6 @@ if st.sidebar.button("Run Backtest", type="primary"):
             status.update(label="✅ Backtest Execution Complete!", state="complete", expanded=False)
             
         except Exception as e:
-            # THIS IS THE PROPER EXCEPT BLOCK TO AVOID THE INDENTATION ERROR
             status.update(label="❌ ERROR: Code Crashed!", state="error", expanded=True)
             st.error(f"An unexpected error occurred during execution:")
             st.code(traceback.format_exc(), language="python")
@@ -175,13 +173,16 @@ if st.sidebar.button("Run Backtest", type="primary"):
             use_container_width=True
         )
         
-        st.markdown("#### Cloud Backup")
-        if st.button("☁️ Push Results to GitHub Repository", type="secondary", use_container_width=True):
-            with st.spinner("Pushing files to GitHub..."):
+        # --- AUTO GITHUB PUSH ---
+        github_token = st.secrets.get("GITHUB_TOKEN", "")
+        if github_repo and github_token:
+            with st.spinner("☁️ Auto-pushing results to GitHub..."):
                 t_success = push_csv_to_github(csv_trades_str, f"backtest_results/{trades_filename}", github_repo)
                 m_success = push_csv_to_github(csv_metrics_str, f"backtest_results/{metrics_filename}", github_repo)
                 
                 if t_success and m_success:
-                    st.success("Successfully pushed both Trade Log and Metrics to GitHub!")
+                    st.success("✅ Successfully auto-pushed Trade Log and Metrics to GitHub!")
+        else:
+            st.info("GitHub Repository or Token not configured. Skipping auto-push.")
     else:
         st.warning(f"[{get_time()}] Execution finished, but the final trade log was empty.")
