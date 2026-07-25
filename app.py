@@ -2,29 +2,12 @@
 =====================================================================================
 STOCHASTIC INDEX INTRADAY MOMENTUM - STREAMLIT WEB INTERFACE (APP.PY)
 =====================================================================================
-DESCRIPTION:
-This script acts as the frontend user interface for the backtesting engine. 
-It collects user inputs (API tokens, days of history, instruments), runs the 
-modular functions from `backtest_engine.py`, and displays the results interactively.
-
-STRATEGY LOGIC:
-- Long: Futures HTF Bias (Close > EMA 25, Stoch %K > %D, OBV > SMA 20) + 
-        LTF Execution (Close > Open, Stoch K crosses D, Volume Surge).
-        Executes a Bull Put Spread (Sell ATM PE, Buy OTM2 PE).
-- Short: Reverse of the above conditions. Executes a Bear Call Spread.
-- Risk/Reward: 15% Stop Loss on ATM Entry, 30% Take Profit on Net Credit.
-
-FEATURES INCLUDED:
-1. Live Status Console: Shows exact execution steps and row counts in real-time.
-2. Local CSV Download: Allows saving the metrics and trade log to your local device.
-3. GitHub Cloud Push: Uses the PyGithub API to push the generated CSVs directly 
-   to your GitHub repository.
-=====================================================================================
 """
 
 import streamlit as st
 import pandas as pd
 import datetime
+import traceback
 from github import Github
 
 # Import modular functions from your backtest engine
@@ -36,7 +19,6 @@ from backtest_engine import (
 
 # --- GITHUB PUSH FUNCTION ---
 def push_csv_to_github(csv_string, filename, repo_path):
-    """Pushes a CSV string directly to the specified GitHub repository."""
     try:
         github_token = st.secrets.get("GITHUB_TOKEN", "")
         if not github_token:
@@ -65,7 +47,6 @@ st.markdown("Backtest engine for Nifty/Sensex Future signals mapped to Options S
 
 # --- SIDEBAR CONFIGURATION ---
 st.sidebar.header("1. API Configuration")
-# Pull tokens from secrets if they exist, otherwise default to empty string
 default_upstox = st.secrets.get("UPSTOX_API_TOKEN", "")
 api_token = st.sidebar.text_input("Upstox API Token", type="password", value=default_upstox)
 
@@ -80,73 +61,94 @@ selected_instruments = st.sidebar.multiselect(
 st.sidebar.header("3. GitHub Export Config")
 github_repo = st.sidebar.text_input("GitHub Repo Path", value="your_username/index_stochastic_intraday")
 
+def get_time():
+    return datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
+
 # --- MAIN EXECUTION ---
 if st.sidebar.button("Run Backtest", type="primary"):
+    st.info(f"[{get_time()}] Backtest button clicked. Initializing checks...")
+    
     if not api_token:
-        st.error("Please enter your Upstox API Token in the sidebar.")
+        st.error(f"[{get_time()}] ABORT: Upstox API Token is missing.")
         st.stop()
         
     if not selected_instruments:
-        st.warning("Please select at least one instrument.")
+        st.warning(f"[{get_time()}] ABORT: No instruments selected.")
         st.stop()
         
-    all_trades = pd.DataFrame()
-    my_bar = st.progress(0, text="Initializing engine...")
-    
-    # Live execution console
-    with st.status("🚀 Running Backtest Engine...", expanded=True) as status:
+    st.success(f"[{get_time()}] Checks passed. Token and instruments registered. Starting engine...")
         
-        for idx, symbol in enumerate(selected_instruments):
-            key = INSTRUMENTS[symbol]
-            st.markdown(f"### ⚙️ Processing: {symbol}")
-            
-            st.text(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Fetching {days_to_fetch} days of 1-minute historical data...")
-            df_1m = fetch_historical_1m_data(key, api_token, days=days_to_fetch)
-            
-            if df_1m.empty:
-                st.error(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Failed to fetch data for {symbol}. Check API token.")
-                continue
+    all_trades = pd.DataFrame()
+    my_bar = st.progress(0, text="Preparing to fetch data...")
+    
+    with st.status("🚀 Running Backtest Engine... (Expand to see live logs)", expanded=True) as status:
+        try:
+            for idx, symbol in enumerate(selected_instruments):
+                key = INSTRUMENTS[symbol]
+                st.markdown(f"### ⚙️ Processing: {symbol}")
                 
-            st.text(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ✔️ Data fetch successful! Loaded {len(df_1m)} rows.")
+                # --- DATA FETCHING ---
+                st.text(f"[{get_time()}] >> Requesting {days_to_fetch} days of 1m data for {key}...")
+                df_1m = fetch_historical_1m_data(key, api_token, days=days_to_fetch)
                 
-            for ltf_str, htf_str in TIMEFRAME_COMBOS:
-                st.text(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ⏳ Evaluating Timeframes: {ltf_str} / {htf_str}")
-                
-                ltf_df, htf_df = resample_timeframes(df_1m, ltf_str, htf_str)
-                ltf_df, htf_df = calculate_strategy_indicators(ltf_df, htf_df)
-                st.text(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 🧮 Calculated Indicators.")
-                
-                signals_df = generate_signals(ltf_df, htf_df)
-                combo_trades = simulate_trades(signals_df, symbol, ltf_str, htf_str)
-                
-                if not combo_trades.empty:
-                    st.text(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ✅ Found {len(combo_trades)} trades.")
-                    all_trades = pd.concat([all_trades, combo_trades], ignore_index=True)
-                else:
-                    st.text(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ❌ No trades triggered.")
+                if df_1m is None:
+                    st.error(f"[{get_time()}] CRITICAL: fetch_historical_1m_data returned None.")
+                    continue
+                if df_1m.empty:
+                    st.error(f"[{get_time()}] ERROR: Dataframe is empty. The API returned no data for {symbol}.")
+                    continue
                     
-                st.text("---")
+                st.text(f"[{get_time()}] << Data fetch complete! Loaded {len(df_1m)} rows.")
                     
-            my_bar.progress((idx + 1) / len(selected_instruments), text=f"Completed {symbol}")
+                # --- TIMEFRAME LOOP ---
+                for ltf_str, htf_str in TIMEFRAME_COMBOS:
+                    st.text(f"[{get_time()}] --- Starting timeframe: {ltf_str} / {htf_str} ---")
+                    
+                    st.text(f"[{get_time()}] >> Resampling timeframes...")
+                    ltf_df, htf_df = resample_timeframes(df_1m, ltf_str, htf_str)
+                    st.text(f"[{get_time()}] << Resampling complete. LTF rows: {len(ltf_df)}, HTF rows: {len(htf_df)}")
+                    
+                    st.text(f"[{get_time()}] >> Calculating indicators...")
+                    ltf_df, htf_df = calculate_strategy_indicators(ltf_df, htf_df)
+                    st.text(f"[{get_time()}] << Indicators calculated successfully.")
+                    
+                    st.text(f"[{get_time()}] >> Generating entry/exit signals...")
+                    signals_df = generate_signals(ltf_df, htf_df)
+                    st.text(f"[{get_time()}] << Signals generated. {len(signals_df)} valid signal rows found.")
+                    
+                    st.text(f"[{get_time()}] >> Simulating options trades...")
+                    combo_trades = simulate_trades(signals_df, symbol, ltf_str, htf_str)
+                    
+                    if not combo_trades.empty:
+                        st.text(f"[{get_time()}] ✅ FOUND {len(combo_trades)} trades for {ltf_str}/{htf_str}.")
+                        all_trades = pd.concat([all_trades, combo_trades], ignore_index=True)
+                    else:
+                        st.text(f"[{get_time()}] ❌ 0 trades triggered for this combination.")
+                        
+                my_bar.progress((idx + 1) / len(selected_instruments), text=f"Completed {symbol}")
+                
+            status.update(label="✅ Backtest Execution Complete!", state="complete", expanded=False)
             
-        status.update(label="✅ Backtest Execution Complete!", state="complete", expanded=False)
+        except Exception as e:
+            # THIS IS THE MOST IMPORTANT PART: Catches silent errors and prints the traceback
+            status.update(label="❌ ERROR: Code Crashed!", state="error", expanded=True)
+            st.error(f"An unexpected error occurred during execution:")
+            st.code(traceback.format_exc(), language="python")
+            st.stop()
             
     my_bar.empty() 
     
     # --- DISPLAY & EXPORT RESULTS ---
     if not all_trades.empty:
-        st.success("Results compiled successfully!")
+        st.success(f"[{get_time()}] UI Rendering: Displaying results tables...")
         
-        # Display Metrics
         metrics_df = calculate_portfolio_metrics(all_trades)
         st.subheader("Performance Metrics")
         st.dataframe(metrics_df, use_container_width=True)
         
-        # Display Trades
         st.subheader("Detailed Trade Log")
         st.dataframe(all_trades, use_container_width=True)
         
-        # Convert DataFrames to CSV strings
         def convert_df(df):
             return df.to_csv(index=False).encode('utf-8')
             
@@ -162,7 +164,6 @@ if st.sidebar.button("Run Backtest", type="primary"):
         st.divider()
         st.subheader("💾 Export Options")
         
-        # Local Download Row
         col1, col2 = st.columns(2)
         col1.download_button(
             label="📥 Download Trade Log to Device",
@@ -179,7 +180,6 @@ if st.sidebar.button("Run Backtest", type="primary"):
             use_container_width=True
         )
         
-        # GitHub Push Row
         st.markdown("#### Cloud Backup")
         if st.button("☁️ Push Results to GitHub Repository", type="secondary", use_container_width=True):
             with st.spinner("Pushing files to GitHub..."):
@@ -189,4 +189,4 @@ if st.sidebar.button("Run Backtest", type="primary"):
                 if t_success and m_success:
                     st.success("Successfully pushed both Trade Log and Metrics to GitHub!")
     else:
-        st.warning("No trades were generated across any timeframe combinations for the selected period.")
+        st.warning(f"[{get_time()}] Execution finished, but the final trade log was empty.")
