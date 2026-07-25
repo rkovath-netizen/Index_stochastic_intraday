@@ -1,177 +1,220 @@
 """
-STRATEGY LOGIC: Stochastic Index Intraday Momentum
+STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
-DYNAMIC INSTRUMENT RESOLUTION:
-1. Fetches historical expiry dates for a given underlying (e.g., NIFTY).
-2. Uses the entry date to find the current active historical expiry.
-3. Dynamically fetches the exact historical instrument_keys for Expired Futures and Options.
-4. Generates Option Spread signals (ATM and OTM2 strikes) dynamically based on the entry price.
+ARCHITECTURE UPDATES:
+- Aligns weekly option expiries with monthly future expiries.
+- Dynamically resolves Base Index -> Future Key -> Option Keys.
+- Fetches Option OHLC data at the exact signal minute to calculate the spread entry.
 """
 
 import os
 import requests
 import pandas as pd
 import pandas_ta as ta
-import datetime
-from datetime import timedelta
-import traceback
-import math
+from datetime import datetime, timedelta
+import urllib.parse
+import gzip
+import csv
+import io
+import time
+import re
 
 # ==========================================
-# MODULE 1: CONFIGURATION & CONSTANTS
+# MODULE 1: CONSTANTS & CONFIGURATION
 # ==========================================
-BASE_URL = "https://api.upstox.com/v2"
-
-# Map human-readable index names to Upstox base symbol parameters
-UNDERLYING_MAP = {
-    "NIFTY": {"symbol": "NIFTY", "strike_step": 50},
-    "SENSEX": {"symbol": "SENSEX", "strike_step": 100}
-}
-
 TIMEFRAME_COMBOS = [
     ('3min', '15min'),
     ('5min', '30min'),
     ('10min', '60min')
 ]
 
+INDEX_CONFIG = {
+    "NIFTY": {"underlying": "NSE_INDEX|Nifty 50", "step": 50, "segment": "NSE_FO"},
+    "SENSEX": {"underlying": "BSE_INDEX|SENSEX", "step": 100, "segment": "BSE_FO"}
+}
+
+def robust_api_get(url, headers, max_retries=3, params=None):
+    """Handles rate limits and connection drops gracefully.[span_3](start_span)[span_3](end_span)"""
+    for attempt in range(max_retries):
+        res = requests.get(url, headers=headers, params=params)
+        if res.status_code == 200: return res
+        elif res.status_code == 429: time.sleep(2 ** attempt) 
+        else: time.sleep(1)
+    return res
+
 # ==========================================
-# MODULE 2: DYNAMIC CONTRACT RESOLUTION (UPSTOX API)
+# MODULE 2: EXPIRY & CONTRACT RESOLUTION
 # ==========================================
-def get_historical_expiries(instrument_name, token):
+def get_closest_expiry(symbol, trade_date_str, token, require_monthly=False):
     """
-    Fetches the list of all historical expiries for a given index.
-    Endpoint Ref: https://upstox.com/developer/api-documentation/get-expiries
+    Fetches all valid expiries (live and expired) and finds the closest one to the trade date.
+    Index Options use Weekly (require_monthly=False). Index Futures use Monthly (require_monthly=True).[span_4](start_span)[span_4](end_span)
+    """
+    available_expiries = set()
+    underlying_key = INDEX_CONFIG[symbol]["underlying"]
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    
+    # 1. Fetch expired expiries from Upstox
+    url = "https://api.upstox.com/v2/expired-instruments/expiries"
+    res = robust_api_get(url, headers, params={"instrument_key": underlying_key})
+    if res and res.status_code == 200 and res.json().get("status") == "success":
+        for d in res.json().get("data", []):
+            if isinstance(d, str): available_expiries.add(d)
+            elif isinstance(d, dict) and "expiry_date" in d: available_expiries.add(d["expiry_date"])
+                
+    # 2. Fetch live expiries from the gzip dump
+    url_csv = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+    res_csv = requests.get(url_csv)
+    if res_csv.status_code == 200:
+        with gzip.open(io.BytesIO(res_csv.content), 'rt', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if symbol in row.get('tradingsymbol', '').upper() and row.get('expiry'):
+                    available_expiries.add(row.get('expiry'))
+                    
+    # Filter and sort dates
+    valid_dates = sorted([d for d in available_expiries if d >= trade_date_str])
+    
+    if not valid_dates:
+        return None
+        
+    # Standard monthly derivatives generally expire on the last Thursday of the month. 
+    # For robust historical mapping, we approximate monthly by checking if the date is near month-end.
+    if require_monthly:
+        for date_str in valid_dates:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            # If the next month is different from this date + 7 days, it's likely the last week of the month
+            if (dt + timedelta(days=7)).month != dt.month:
+                return date_str
+        return valid_dates[-1] # Fallback
+        
+    return valid_dates[0] # Return the immediate closest weekly expiry
+
+def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", strike=None, opt_type=None):
+    """
+    Finds the exact instrument_key. Switches between the 'search' API for active 
+    contracts and 'expired-instruments' API for historical ones.[span_5](start_span)[span_5](end_span)[span_6](start_span)[span_6](end_span)
     """
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
-    # Note: Adjust the exact URL path based on Upstox's current v2 schema for expiries
-    url = f"{BASE_URL}/historical/expiries/{instrument_name}" 
+    expiry_dt = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
+    today_dt = datetime.today().date()
     
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            data = response.json().get('data', [])
-            # Convert to datetime objects and sort ascending
-            expiries = sorted([datetime.datetime.strptime(d, '%Y-%m-%d').date() for d in data])
-            return expiries
-        else:
-            print(f"[API ERROR] Failed to fetch expiries: {response.text}")
-            return []
-    except Exception as e:
-        print(f"[API EXCEPTION] Expiry fetch failed: {e}")
-        return []
-
-def get_expired_future_contract(instrument_name, expiry_date_str, token):
-    """
-    Retrieves the exact instrument_key for a future contract that has already expired.
-    Endpoint Ref: https://upstox.com/developer/api-documentation/get-expired-future-contracts
-    """
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
-    url = f"{BASE_URL}/historical-contracts/future/{instrument_name}?expiry_date={expiry_date_str}"
+    segment = INDEX_CONFIG[symbol]["segment"]
     
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            # Assuming the API returns a list of contracts for that expiry, extract the instrument_key
-            contracts = response.json().get('data', [])
-            if contracts:
-                return contracts[0].get('instrument_key')
-        return None
-    except Exception as e:
-        print(f"[API EXCEPTION] Future contract fetch failed: {e}")
-        return None
-
-def get_expired_option_contract(instrument_name, expiry_date_str, strike, option_type, token):
-    """
-    Retrieves the exact instrument_key for an expired option contract (CE/PE) at a specific strike.
-    Endpoint Ref: https://upstox.com/developer/api-documentation/get-expired-option-contracts
-    """
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
-    url = f"{BASE_URL}/historical-contracts/option/{instrument_name}?expiry_date={expiry_date_str}"
-    
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            contracts = response.json().get('data', [])
-            # Filter the JSON response for the exact strike and option type (CE or PE)
-            for contract in contracts:
-                if contract.get('strike') == strike and contract.get('instrument_type') == option_type:
-                    return contract.get('instrument_key')
-        return None
-    except Exception as e:
-        print(f"[API EXCEPTION] Option contract fetch failed: {e}")
-        return None
-
-def find_next_expiry(current_date, expiries_list):
-    """Utility to find the closest expiry date strictly after the current entry date."""
-    for expiry in expiries_list:
-        if expiry >= current_date.date():
-            return expiry
+    if expiry_dt >= today_dt:
+        # LIVE CONTRACT: Use the v2 search API[span_7](start_span)[span_7](end_span)
+        query = f"{symbol}"
+        if strike: query += f" {int(strike)}"
+        
+        search_params = {
+            "query": query,
+            "segments": segment,
+            "instrument_types": inst_type if not opt_type else opt_type,
+            "expiry": expiry_date_str
+        }
+        res = robust_api_get("https://api.upstox.com/v2/instruments/search", headers, params=search_params)
+        if res and res.status_code == 200:
+            data = res.json().get('data', [])
+            if data: return data[0].get('instrument_key')
+            
+    else:
+        # EXPIRED CONTRACT: Use v2 expired API[span_8](start_span)[span_8](end_span)
+        api_type = "option" if inst_type == "OPTIDX" else "future"
+        underlying = INDEX_CONFIG[symbol]["underlying"]
+        
+        url = f"https://api.upstox.com/v2/expired-instruments/{api_type}/contract"
+        params = {"instrument_key": underlying, "expiry_date": expiry_date_str}
+        
+        res = robust_api_get(url, headers, params=params)
+        if res and res.status_code == 200:
+            contracts = res.json().get("data", [])
+            for c in contracts:
+                tsym = c.get("trading_symbol", "").upper()
+                if inst_type == "FUTIDX" and "FUT" in tsym:
+                    return c.get("instrument_key")
+                elif inst_type == "OPTIDX" and opt_type in tsym:
+                    # Parse strike from symbol (e.g., NIFTY26JUL24500CE)
+                    match = re.search(r'(\d+(\.\d+)?)(CE|PE)$', tsym)
+                    if match and float(match.group(1)) == float(strike):
+                        return c.get("instrument_key")
     return None
 
 # ==========================================
-# MODULE 3: HISTORICAL DATA FETCHING
+# MODULE 3: DATA FETCHING
 # ==========================================
-def fetch_historical_candle_data(instrument_key, token, interval='1minute', days=30):
+def fetch_candle_data(instrument_key, start_date_str, token, interval='1minute'):
     """
-    Fetches historical candle data for the dynamically resolved instrument_key.
-    The user can pass '1minute', '30minute', or '1hour' as needed.
+    Fetches base historical data for generating signals. 
+    Uses V3 for intraday active, V2 for deep historical.[span_9](start_span)[span_9](end_span)
     """
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
-    to_date = datetime.datetime.now().strftime('%Y-%m-%d')
-    from_date = (datetime.datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    encoded_key = urllib.parse.quote(instrument_key)
+    today_str = datetime.today().strftime('%Y-%m-%d')
     
-    url = f"{BASE_URL}/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
+    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{interval}/{today_str}/{start_date_str}"
+    print(f"[ENGINE] Fetching base chart: {url}")
     
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            print(f"[ENGINE ERROR] Candle API returned: {response.text}")
-            return pd.DataFrame()
-            
-        data = response.json().get('data', {}).get('candles', [])
-        if not data:
-            return pd.DataFrame()
-            
-        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+    res = robust_api_get(url, headers)
+    if res and res.status_code == 200:
+        candles = res.json().get('data', {}).get('candles', [])
+        if not candles: return pd.DataFrame()
+        
+        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol', 'oi'])
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
-        df = df.sort_index()
+        return df.sort_index().astype(float)
+    return pd.DataFrame()
+
+def get_specific_candle_close(instrument_key, target_dt_str, token):
+    """
+    Fetches the specific 1-minute close price for the option leg at the exact signal time.[span_10](start_span)[span_10](end_span)
+    target_dt_str format: 'YYYY-MM-DD HH:MM'
+    """
+    if not instrument_key: return 0.0
+    
+    target_date = target_dt_str[:10]
+    target_time = target_dt_str[11:16]
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    encoded_key = urllib.parse.quote(instrument_key)
+    
+    if instrument_key.count('|') >= 2:
+        url = f"https://api.upstox.com/v2/expired-instruments/historical-candle/{encoded_key}/1minute/{target_date}/{target_date}"
+    else:
+        url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/minutes/1" # v3 syntax[span_11](start_span)[span_11](end_span)
         
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col])
-            
-        return df
-    except Exception as e:
-        print(f"[ENGINE CRITICAL] Crash during candle fetch: {e}")
-        return pd.DataFrame()
+    res = robust_api_get(url, headers)
+    if res and res.status_code == 200:
+        candles = res.json().get("data", {}).get("candles", [])
+        for candle in candles:
+            if str(candle[0])[:16].replace('T', ' ') >= target_dt_str:
+                return float(candle[4]) # Close price
+    return 0.0
 
 # ==========================================
-# MODULE 4: TIMEFRAMES & INDICATORS
+# MODULE 4: STRATEGY LOGIC
 # ==========================================
 def resample_timeframes(df_base, ltf_interval, htf_interval):
-    """Resamples the base fetched data into strategy-specific timeframes."""
-    agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+    agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'vol': 'sum'}
     ltf_df = df_base.resample(ltf_interval).agg(agg_dict).dropna()
     htf_df = df_base.resample(htf_interval).agg(agg_dict).dropna()
     return ltf_df, htf_df
 
 def calculate_strategy_indicators(ltf, htf):
-    """Calculates EMAs, Stochastics, and OBV."""
     # HTF
     htf['ema_25'] = ta.ema(htf['close'], length=25)
     stoch_htf = ta.stoch(htf['high'], htf['low'], htf['close'], k=14, d=3, smooth_k=3)
     if stoch_htf is not None: htf = htf.join(stoch_htf)
-    htf['obv'] = ta.obv(htf['close'], htf['volume'])
+    htf['obv'] = ta.obv(htf['close'], htf['vol'])
     htf['obv_sma_20'] = ta.sma(htf['obv'], length=20)
     
-    htf.rename(columns={col: 'htf_stoch_k' for col in htf.columns if 'STOCHk' in col}, inplace=True)
-    htf.rename(columns={col: 'htf_stoch_d' for col in htf.columns if 'STOCHd' in col}, inplace=True)
+    htf.rename(columns={c: 'htf_stoch_k' for c in htf.columns if 'STOCHk' in c}, inplace=True)
+    htf.rename(columns={c: 'htf_stoch_d' for c in htf.columns if 'STOCHd' in c}, inplace=True)
 
     # LTF
     stoch_ltf = ta.stoch(ltf['high'], ltf['low'], ltf['close'], k=14, d=3, smooth_k=3)
     if stoch_ltf is not None: ltf = ltf.join(stoch_ltf)
-    ltf.rename(columns={col: 'ltf_stoch_k' for col in ltf.columns if 'STOCHk' in col}, inplace=True)
-    ltf.rename(columns={col: 'ltf_stoch_d' for col in ltf.columns if 'STOCHd' in col}, inplace=True)
+    ltf.rename(columns={c: 'ltf_stoch_k' for c in ltf.columns if 'STOCHk' in c}, inplace=True)
+    ltf.rename(columns={c: 'ltf_stoch_d' for c in ltf.columns if 'STOCHd' in c}, inplace=True)
     
     if 'ltf_stoch_k' in ltf.columns and 'ltf_stoch_d' in ltf.columns:
         ltf['stoch_cross_up'] = (ltf['ltf_stoch_k'] > ltf['ltf_stoch_d']) & (ltf['ltf_stoch_k'].shift(1) <= ltf['ltf_stoch_d'].shift(1))
@@ -180,14 +223,13 @@ def calculate_strategy_indicators(ltf, htf):
     return ltf, htf
 
 def generate_signals(ltf, htf):
-    """Merges timeframes and identifies entry triggers."""
     required_htf_cols = ['ema_25', 'htf_stoch_k', 'htf_stoch_d', 'obv', 'obv_sma_20']
     htf_aligned = htf[[c for c in required_htf_cols if c in htf.columns]].reindex(ltf.index, method='ffill').fillna(0)
     df = ltf.join(htf_aligned)
     
     df['htf_long_bias'] = (df['close'] > df['ema_25']) & (df['htf_stoch_k'] > df['htf_stoch_d']) & (df['obv'] > df['obv_sma_20'])
     df['htf_short_bias'] = (df['close'] < df['ema_25']) & (df['htf_stoch_k'] < df['htf_stoch_d']) & (df['obv'] < df['obv_sma_20'])
-    df['vol_surge'] = (df['volume'] > df['volume'].shift(1)) & (df['volume'] > df['volume'].shift(2))
+    df['vol_surge'] = (df['vol'] > df['vol'].shift(1)) & (df['vol'] > df['vol'].shift(2))
     
     if 'stoch_cross_up' in df.columns:
         df['long_signal'] = (df['close'] > df['open']) & df['stoch_cross_up'].shift(1).fillna(False) & df['vol_surge'] & df['htf_long_bias']
@@ -198,81 +240,69 @@ def generate_signals(ltf, htf):
     return df.dropna()
 
 # ==========================================
-# MODULE 5: TRADE SIMULATION & SPREAD GENERATION
+# MODULE 5: TRADE SIMULATION & SPREAD PRICING
 # ==========================================
-def simulate_trades(df, symbol_key, ltf_str, htf_str, token):
+def simulate_trades(df, symbol, ltf_str, htf_str, token):
     """
-    Iterates through signals. When a signal is found:
-    1. Looks up the expiry for that specific timestamp.
-    2. Calculates the ATM and OTM2 strikes based on underlying rules.
-    3. Fetches the historical options instrument keys to simulate the spread.
+    1. Detects signal.
+    2. Calculates ATM strike.
+    3. Finds Option Keys for Weekly Expiry.
+    4. Fetches EXACT entry prices for both legs at the signal minute.
     """
     trades = []
-    underlying_info = UNDERLYING_MAP.get(symbol_key)
-    if not underlying_info:
-        return pd.DataFrame()
-        
-    strike_step = underlying_info['strike_step']
-    instrument_name = underlying_info['symbol']
-    
-    # Pre-fetch expiries once to save API calls in the loop
-    expiries = get_historical_expiries(instrument_name, token)
+    step = INDEX_CONFIG[symbol]["step"]
     
     for idx, row in df.iterrows():
-        entry_price = row['close']
-        current_date = pd.to_datetime(idx)
-        
         if row['long_signal'] or row['short_signal']:
-            # 1. Determine active expiry for this exact trade date
-            active_expiry = find_next_expiry(current_date, expiries)
-            expiry_str = active_expiry.strftime('%Y-%m-%d') if active_expiry else "UNKNOWN"
+            entry_dt_str = str(idx)[:16]
+            entry_date = entry_dt_str[:10]
+            future_price = row['close']
             
-            # 2. Calculate ATM Strike dynamically
-            atm_strike = round(entry_price / strike_step) * strike_step
+            # 1. Get exact weekly expiry for this trade
+            weekly_expiry = get_closest_expiry(symbol, entry_date, token, require_monthly=False)
+            if not weekly_expiry: continue
             
-            if row['long_signal']:
-                # Bull Put Spread: Sell ATM PE, Buy OTM2 PE (OTM Put is lower strike)
-                otm2_strike = atm_strike - (strike_step * 2)
-                
-                trades.append({
-                    'Entry_Time': idx,
-                    'Underlying': instrument_name,
-                    'Expiry': expiry_str,
-                    'TF_Combo': f"{ltf_str}/{htf_str}",
-                    'Trade_Type': 'Bull Put Spread',
-                    'Future_Price': entry_price,
-                    'Sell_Leg': f"{atm_strike} PE",
-                    'Buy_Leg': f"{otm2_strike} PE",
-                    # Simulated Lookup (Requires Options API Call)
-                    # 'Sell_Leg_Key': get_expired_option_contract(instrument_name, expiry_str, atm_strike, 'PE', token),
-                    # 'Buy_Leg_Key': get_expired_option_contract(instrument_name, expiry_str, otm2_strike, 'PE', token),
-                    'Result': 'Pending_Data'
-                })
-                
-            elif row['short_signal']:
-                # Bear Call Spread: Sell ATM CE, Buy OTM2 CE (OTM Call is higher strike)
-                otm2_strike = atm_strike + (strike_step * 2)
-                
-                trades.append({
-                    'Entry_Time': idx,
-                    'Underlying': instrument_name,
-                    'Expiry': expiry_str,
-                    'TF_Combo': f"{ltf_str}/{htf_str}",
-                    'Trade_Type': 'Bear Call Spread',
-                    'Future_Price': entry_price,
-                    'Sell_Leg': f"{atm_strike} CE",
-                    'Buy_Leg': f"{otm2_strike} CE",
-                    'Result': 'Pending_Data'
-                })
-                
+            # 2. Calculate Strikes
+            atm_strike = round(future_price / step) * step
+            
+            is_long = row['long_signal']
+            trade_type = 'Bull Put Spread' if is_long else 'Bear Call Spread'
+            opt_type = 'PE' if is_long else 'CE'
+            otm2_strike = atm_strike - (step * 2) if is_long else atm_strike + (step * 2)
+            
+            # 3. Resolve Exact Contract Keys for Options[span_12](start_span)[span_12](end_span)
+            sell_leg_key = resolve_exact_contract(symbol, weekly_expiry, token, inst_type="OPTIDX", strike=atm_strike, opt_type=opt_type)
+            buy_leg_key = resolve_exact_contract(symbol, weekly_expiry, token, inst_type="OPTIDX", strike=otm2_strike, opt_type=opt_type)
+            
+            # 4. Fetch the exact entry prices at that specific minute
+            sell_price = get_specific_candle_close(sell_leg_key, entry_dt_str, token) if sell_leg_key else 0.0
+            buy_price = get_specific_candle_close(buy_leg_key, entry_dt_str, token) if buy_leg_key else 0.0
+            net_credit = sell_price - buy_price
+            
+            trades.append({
+                'Entry_Time': entry_dt_str,
+                'Symbol': symbol,
+                'TF_Combo': f"{ltf_str}/{htf_str}",
+                'Trade_Type': trade_type,
+                'Weekly_Expiry': weekly_expiry,
+                'Future_Price': future_price,
+                'Sell_Leg': f"{atm_strike} {opt_type}",
+                'Buy_Leg': f"{otm2_strike} {opt_type}",
+                'Sell_Entry_Price': sell_price,
+                'Buy_Entry_Price': buy_price,
+                'Net_Credit_Received': net_credit,
+                'Stop_Loss': sell_price * 1.15 if sell_price > 0 else 0.0, # 15% SL on ATM
+                'Take_Profit_Target': net_credit * 0.30 if net_credit > 0 else 0.0 # 30% of Net Credit
+            })
+            
     return pd.DataFrame(trades)
 
 def calculate_portfolio_metrics(trades_df):
     if trades_df.empty: return pd.DataFrame()
     metrics = []
-    for (symbol, tf), group in trades_df.groupby(['Underlying', 'TF_Combo']):
+    for (symbol, tf), group in trades_df.groupby(['Symbol', 'TF_Combo']):
         metrics.append({
-            'Underlying': symbol,
+            'Symbol': symbol,
             'Timeframes': tf,
             'Total_Trades': len(group)
         })
