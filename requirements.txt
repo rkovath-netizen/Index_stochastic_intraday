@@ -2,3 +2,4 @@ streamlit
 pandas
 pandas-ta
 requests
+PyGithub
