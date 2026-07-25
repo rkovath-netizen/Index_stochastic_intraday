@@ -1,6 +1,6 @@
 """
 =====================================================================================
-STOCHASTIC INDEX INTRADAY MOMENTUM - STREAMLIT WEB INTERFACE
+STOCHASTIC INDEX INTRADAY MOMENTUM - STREAMLIT WEB INTERFACE (APP.PY)
 =====================================================================================
 """
 
@@ -54,7 +54,7 @@ st.sidebar.caption("💡 Run with 5 days first to safely generate the GitHub cac
 selected_instruments = st.sidebar.multiselect(
     "Select Underlying Index", 
     options=list(INDEX_CONFIG.keys()), 
-    default=["NIFTY"]
+    default=["NIFTY", "SENSEX"]
 )
 
 st.sidebar.header("3. GitHub Export Config")
@@ -79,14 +79,15 @@ if st.sidebar.button("Run Backtest", type="primary"):
     github_token = st.secrets.get("GITHUB_TOKEN", "")
     
     with st.status("🚀 Running Backtest Engine...", expanded=True) as status:
-        try:
-            for idx, symbol in enumerate(selected_instruments):
+        for idx, symbol in enumerate(selected_instruments):
+            # CRITICAL FIX: The try/except is now INSIDE the loop. 
+            # If Sensex fails, it skips it and still saves Nifty!
+            try:
                 st.markdown(f"### ⚙️ Processing: {symbol}")
                 start_date_str = (datetime.datetime.now(IST) - datetime.timedelta(days=days_to_fetch)).strftime('%Y-%m-%d')
                 
                 st.text(f"[{get_time()}] Building Continuous Chart from {start_date_str}...")
                 
-                # --- The engine now looks for the data on GitHub first ---
                 df_1m, all_expiries, is_newly_built = build_continuous_futures(symbol, start_date_str, api_token, github_repo)
                 
                 if df_1m is None or df_1m.empty:
@@ -95,7 +96,6 @@ if st.sidebar.button("Run Backtest", type="primary"):
                     
                 st.text(f"[{get_time()}] Loaded {len(df_1m)} rows.")
                 
-                # Automatically push the new big data file to GitHub if we had to download it from the API
                 if is_newly_built and github_repo and github_token:
                     st.text(f"[{get_time()}] Backing up {symbol} continuous base data to GitHub to speed up future runs...")
                     push_csv_to_github(df_1m.to_csv(), f"data_cache/{symbol}_continuous.csv", github_repo)
@@ -116,13 +116,13 @@ if st.sidebar.button("Run Backtest", type="primary"):
                         
                 my_bar.progress((idx + 1) / len(selected_instruments), text=f"Completed {symbol}")
                 
-            status.update(label="✅ Backtest Complete!", state="complete", expanded=False)
-            
-        except Exception as e:
-            status.update(label="❌ ERROR: Code Crashed!", state="error", expanded=True)
-            st.error(f"Error during execution:")
-            st.code(traceback.format_exc(), language="python")
-            st.stop()
+            except Exception as e:
+                st.error(f"❌ Error during execution for {symbol}:")
+                st.code(traceback.format_exc(), language="python")
+                st.warning(f"Skipping {symbol} and moving to the next step...")
+                continue # Skip this symbol, but keep running the app!
+                
+        status.update(label="✅ Backtest Operations Concluded!", state="complete", expanded=False)
             
     my_bar.empty() 
     
