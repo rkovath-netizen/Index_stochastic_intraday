@@ -1,6 +1,11 @@
 """
 STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
+MODULES:
+- GitHub/Local Caching: Checks for CSV files on GitHub to bypass API timeouts.
+- Continuous Futures Builder: Stitches front-month futures history.
+- Strict Expiry Matching: Prevents FINNIFTY/BANKNIFTY contamination.
+- Precise Option OHLC Polling: Sorts candles chronologically to grab exact minute pricing.
 """
 
 import os
@@ -110,7 +115,7 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
     return None
 
 # ==========================================
-# MODULE 3: DATA FETCHING & LOCAL CACHING
+# MODULE 3: DATA FETCHING & GITHUB CACHING
 # ==========================================
 def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1minute'):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
@@ -135,21 +140,45 @@ def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1min
     df.set_index('timestamp', inplace=True)
     return df.sort_index().astype(float)
 
-def build_continuous_futures(symbol, start_date_str, token):
+def build_continuous_futures(symbol, start_date_str, token, github_repo=""):
     today_str = datetime.now(IST).strftime('%Y-%m-%d')
     start_dt = datetime.strptime(start_date_str, '%Y-%m-%d').date()
     all_expiries = get_all_expiries(symbol, token)
-    local_filename = f"{symbol}_continuous.csv"
     
+    # 1. TRY GITHUB RAW URL CACHE (FASTEST - Prevents phone timeouts)
+    if github_repo:
+        raw_url = f"https://raw.githubusercontent.com/{github_repo}/main/data_cache/{symbol}_continuous.csv"
+        print(f"[ENGINE] Checking GitHub Cache: {raw_url}")
+        try:
+            res = requests.get(raw_url, timeout=10)
+            if res.status_code == 200:
+                print("[ENGINE] Found data on GitHub! Downloading direct...")
+                df = pd.read_csv(io.StringIO(res.text))
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df.set_index('timestamp', inplace=True)
+                
+                if df.index.min() <= pd.to_datetime(start_date_str):
+                    df = df[df.index >= pd.to_datetime(start_date_str)]
+                    print(f"[ENGINE] Successfully loaded {len(df)} rows from GitHub cache.")
+                    return df, all_expiries, False
+                else:
+                    print("[ENGINE] GitHub cache exists but is too short. Need API fetch.")
+        except Exception as e:
+            print(f"[ENGINE] GitHub cache load failed: {e}")
+
+    # 2. TRY LOCAL SERVER CACHE
+    local_filename = f"{symbol}_continuous.csv"
     if os.path.exists(local_filename):
         print(f"[ENGINE] Loading local cache: {local_filename}")
         df = pd.read_csv(local_filename)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
-        df = df[df.index >= pd.to_datetime(start_date_str)]
-        # Return False to indicate it was loaded from cache
-        return df, all_expiries, False
+        if df.index.min() <= pd.to_datetime(start_date_str):
+            df = df[df.index >= pd.to_datetime(start_date_str)]
+            return df, all_expiries, False
 
+    # 3. FALLBACK TO API STITCHING (SLOW)
+    print(f"[ENGINE] Fetching fresh data from Upstox API...")
     monthly_expiries = get_monthly_expiries(all_expiries)
     relevant_expiries = [e for e in monthly_expiries if datetime.strptime(e, '%Y-%m-%d').date() >= start_dt]
     
@@ -176,7 +205,6 @@ def build_continuous_futures(symbol, start_date_str, token):
             continuous_df.to_csv(local_filename)
         except: pass
         
-    # Return True to indicate a new download occurred
     return continuous_df, all_expiries, True
 
 def get_specific_candle_close(instrument_key, target_dt_str, token):
