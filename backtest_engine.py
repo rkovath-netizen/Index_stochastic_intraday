@@ -3,7 +3,8 @@ STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
 ARCHITECTURE UPDATES:
 - Continuous Futures Builder: Stitches together front-month futures to create a historical chart.
-- Dynamic Weekly Options: Resolves ATM/OTM options based on the exact historical signal timestamp.
+- Strict Expiry Matching: Prevents FINNIFTY/BANKNIFTY contamination for NIFTY expiries.
+- Option Price Polling: Sorts candles chronologically to pull the exact entry minute price.
 """
 
 import os
@@ -64,7 +65,9 @@ def get_all_expiries(symbol, token):
         with gzip.open(io.BytesIO(res_csv.content), 'rt', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if symbol in row.get('tradingsymbol', '').upper() and row.get('expiry'):
+                tsym = row.get('tradingsymbol', '').upper()
+                # CRITICAL FIX: startswith prevents FINNIFTY from bleeding into NIFTY expiries
+                if tsym.startswith(symbol) and row.get('expiry'):
                     available_expiries.add(row.get('expiry'))
                     
     return sorted(list(available_expiries))
@@ -188,6 +191,7 @@ def build_continuous_futures(symbol, start_date_str, token):
     return continuous_df, all_expiries
 
 def get_specific_candle_close(instrument_key, target_dt_str, token):
+    """Fetches the exact Option Price at the given historical minute."""
     if not instrument_key: return 0.0
     target_date = target_dt_str[:10]
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
@@ -201,6 +205,8 @@ def get_specific_candle_close(instrument_key, target_dt_str, token):
     res = robust_api_get(url, headers)
     if res and res.status_code == 200:
         candles = res.json().get("data", {}).get("candles", [])
+        # CRITICAL FIX: Sort chronologically so we catch the exact minute properly
+        candles.sort(key=lambda x: x[0]) 
         for candle in candles:
             if str(candle[0])[:16].replace('T', ' ') >= target_dt_str:
                 return float(candle[4])
@@ -280,7 +286,11 @@ def simulate_trades(df, symbol, ltf_str, htf_str, token, all_expiries):
             
             sell_price = get_specific_candle_close(sell_leg_key, entry_dt_str, token) if sell_leg_key else 0.0
             buy_price = get_specific_candle_close(buy_leg_key, entry_dt_str, token) if buy_leg_key else 0.0
-            net_credit = sell_price - buy_price
+            
+            # Formatting to 2 decimal places to avoid massive floats
+            sell_price = round(sell_price, 2)
+            buy_price = round(buy_price, 2)
+            net_credit = round(sell_price - buy_price, 2)
             
             trades.append({
                 'Entry_Time': entry_dt_str,
@@ -288,14 +298,14 @@ def simulate_trades(df, symbol, ltf_str, htf_str, token, all_expiries):
                 'TF_Combo': f"{ltf_str}/{htf_str}",
                 'Trade_Type': trade_type,
                 'Weekly_Expiry': weekly_expiry,
-                'Future_Price': future_price,
+                'Future_Price': round(future_price, 2),
                 'Sell_Leg': f"{atm_strike} {opt_type}",
                 'Buy_Leg': f"{otm2_strike} {opt_type}",
                 'Sell_Entry_Price': sell_price,
                 'Buy_Entry_Price': buy_price,
                 'Net_Credit_Received': net_credit,
-                'Stop_Loss': sell_price * 1.15 if sell_price > 0 else 0.0,
-                'Take_Profit_Target': net_credit * 0.30 if net_credit > 0 else 0.0
+                'Stop_Loss': round(sell_price * 1.15, 2) if sell_price > 0 else 0.0,
+                'Take_Profit_Target': round(net_credit * 0.30, 2) if net_credit > 0 else 0.0
             })
             
     return pd.DataFrame(trades)
