@@ -1,11 +1,6 @@
 """
 STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
-MODULES:
-- Local Caching: Checks for local CSV files (e.g., NIFTY_continuous.csv) to bypass API rate limits and delays.
-- Continuous Futures Builder: Stitches front-month futures history.
-- Strict Expiry Matching: Prevents FINNIFTY/BANKNIFTY contamination.
-- Precise Option OHLC Polling: Sorts candles chronologically to grab exact minute pricing.
 """
 
 import os
@@ -19,10 +14,13 @@ import csv
 import io
 import time
 import re
+import pytz
 
 # ==========================================
 # MODULE 1: CONSTANTS & CONFIGURATION
 # ==========================================
+IST = pytz.timezone('Asia/Kolkata')
+
 TIMEFRAME_COMBOS = [
     ('3min', '15min'),
     ('5min', '30min'),
@@ -84,7 +82,7 @@ def get_closest_weekly_expiry(all_expiries, target_date_str):
 def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", strike=None, opt_type=None):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     expiry_dt = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
-    today_dt = datetime.today().date()
+    today_dt = datetime.now(IST).date()
     segment = INDEX_CONFIG[symbol]["segment"]
     
     if expiry_dt >= today_dt:
@@ -138,20 +136,19 @@ def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1min
     return df.sort_index().astype(float)
 
 def build_continuous_futures(symbol, start_date_str, token):
-    today_str = datetime.today().strftime('%Y-%m-%d')
+    today_str = datetime.now(IST).strftime('%Y-%m-%d')
     start_dt = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-    
     all_expiries = get_all_expiries(symbol, token)
-    
-    # Check local cache first to avoid API bottlenecks
     local_filename = f"{symbol}_continuous.csv"
+    
     if os.path.exists(local_filename):
         print(f"[ENGINE] Loading local cache: {local_filename}")
         df = pd.read_csv(local_filename)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
         df = df[df.index >= pd.to_datetime(start_date_str)]
-        return df, all_expiries
+        # Return False to indicate it was loaded from cache
+        return df, all_expiries, False
 
     monthly_expiries = get_monthly_expiries(all_expiries)
     relevant_expiries = [e for e in monthly_expiries if datetime.strptime(e, '%Y-%m-%d').date() >= start_dt]
@@ -179,7 +176,8 @@ def build_continuous_futures(symbol, start_date_str, token):
             continuous_df.to_csv(local_filename)
         except: pass
         
-    return continuous_df, all_expiries
+    # Return True to indicate a new download occurred
+    return continuous_df, all_expiries, True
 
 def get_specific_candle_close(instrument_key, target_dt_str, token):
     if not instrument_key: return 0.0
