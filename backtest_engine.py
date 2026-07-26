@@ -4,8 +4,9 @@ STRATEGY: Stochastic Index Intraday Momentum
 MODULES:
 - Strict Symbol Matching: Hardened boundaries prevent NIFTYFIN/BANKNIFTY contamination.
 - GitHub/Local Caching: Checks for CSV files on GitHub to bypass API timeouts.
+- Cache Validation: Prevents loading corrupted/incomplete cache files from previous crashes.
 - Timezone Normalization: Strips tz-aware metadata for smooth date comparisons.
-- Future Resolution: Safely handles BSE symbol formats without requiring "FUT" suffixes.
+- Advanced Option Resolution: Uses Regex to mathematically match strikes, ignoring ".00" decimals.
 - Precise Option OHLC Polling: Sorts candles chronologically.
 - Safety Catch: Gracefully handles missing data to prevent KeyErrors.
 """
@@ -126,7 +127,6 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
         
         if res and res.status_code == 200:
             contracts = res.json().get("data", [])
-            target_suffix = f"{int(strike)}{opt_type}" if inst_type == "OPTIDX" else ""
             
             for c in contracts:
                 tsym_raw = str(c.get("trading_symbol", ""))
@@ -135,17 +135,21 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                 if not is_exact_symbol(tsym_raw, symbol):
                     continue
                 
-                # CRITICAL FIX: Since the API only returned Futures, we don't need to check for a "FUT" suffix
                 if inst_type == "FUTIDX":
                     return c.get("instrument_key")
                 
-                # For options, check the suffix
-                tsym_clean = tsym_raw.upper().replace(" ", "")
-                if tsym_clean.endswith(target_suffix):
-                    return c.get("instrument_key")
-                    
+                # CRITICAL FIX: Regex Mathematical Strike Matching
+                if inst_type == "OPTIDX":
+                    tsym_clean = tsym_raw.upper().replace(" ", "")
+                    if tsym_clean.endswith(opt_type):
+                        # Extracts the number (e.g. 23900 or 23900.00) from the end of the string
+                        match = re.search(r'(\d+(?:\.\d+)?)(?:CE|PE)$', tsym_clean)
+                        if match and float(match.group(1)) == float(strike):
+                            return c.get("instrument_key")
+                            
             if logger and inst_type == "OPTIDX":
-                logger(f"WARN: Could not match option for {symbol} {target_suffix} on {expiry_date_str}. Total contracts returned: {len(contracts)}")
+                sample_symbols = [c.get("trading_symbol") for c in contracts[:5]]
+                logger(f"WARN: Could not match option for {symbol} {strike}{opt_type} on {expiry_date_str}. API returned {len(contracts)} contracts. Sample symbols: {sample_symbols}")
     return None
 
 # ==========================================
@@ -197,13 +201,17 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
                         df.index = df.index.tz_localize(None)
                     
                     if df.index.min() <= pd.to_datetime(start_date_str):
-                        df = df[df.index >= pd.to_datetime(start_date_str)]
-                        
-                        if not df.empty:
-                            if logger: logger(f"Successfully loaded {len(df)} rows from GitHub cache.")
-                            return df, all_expiries, False
+                        # CRITICAL FIX: Validate that the cache isn't an incomplete chunk from a previous crash
+                        if df.index.max() >= pd.to_datetime(today_str) - timedelta(days=5):
+                            df = df[df.index >= pd.to_datetime(start_date_str)]
+                            
+                            if not df.empty:
+                                if logger: logger(f"Successfully loaded {len(df)} rows from GitHub cache.")
+                                return df, all_expiries, False
+                            else:
+                                if logger: logger("Filtered cache resulted in 0 rows. Forcing fresh API download...")
                         else:
-                            if logger: logger("Filtered cache resulted in 0 rows. Forcing fresh API download...")
+                            if logger: logger(f"GitHub cache is incomplete (ends on {df.index.max().date()}). Forcing fresh API download...")
                     else:
                         if logger: logger("GitHub cache exists but is too short. Forcing fresh API download...")
         except Exception as e:
@@ -219,9 +227,10 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
                 df.index = df.index.tz_localize(None)
                 
             if df.index.min() <= pd.to_datetime(start_date_str):
-                df = df[df.index >= pd.to_datetime(start_date_str)]
-                if not df.empty:
-                    return df, all_expiries, False
+                if df.index.max() >= pd.to_datetime(today_str) - timedelta(days=5):
+                    df = df[df.index >= pd.to_datetime(start_date_str)]
+                    if not df.empty:
+                        return df, all_expiries, False
 
     if logger: logger(f"Fetching fresh data from Upstox API...")
     monthly_expiries = get_monthly_expiries(all_expiries)
