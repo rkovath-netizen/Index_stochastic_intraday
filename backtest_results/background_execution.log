@@ -1,27 +1,85 @@
-[2026-07-26 12:32:54] --- BACKGROUND BACKTEST STARTED FOR 30 DAYS ---
-[2026-07-26 12:32:54] Processing NIFTY...
-[2026-07-26 12:32:56] Checking GitHub Cache: https://raw.githubusercontent.com/rkovath-netizen/Index_stochastic_intraday/main/data_cache/NIFTY_continuous.csv
-[2026-07-26 12:32:56] GitHub cache exists but is too short. Forcing fresh API download...
-[2026-07-26 12:32:56] Fetching fresh data from Upstox API...
-[2026-07-26 12:33:56] Loaded 750 base rows for NIFTY.
-[2026-07-26 12:33:56] Caching new NIFTY continuous data to GitHub...
-[2026-07-26 12:33:59] Successfully updated data_cache/NIFTY_continuous.csv on GitHub.
-[2026-07-26 12:33:59] Evaluating Strategy: 3min / 15min for NIFTY...
-[2026-07-26 12:34:04] Simulating trades and fetching Option prices for 3min/15min...
-[2026-07-26 12:34:06] Found 1 trades for 3min/15min.
-[2026-07-26 12:34:06] Evaluating Strategy: 5min / 30min for NIFTY...
-[2026-07-26 12:34:06] Simulating trades and fetching Option prices for 5min/30min...
-[2026-07-26 12:34:09] Found 1 trades for 5min/30min.
-[2026-07-26 12:34:09] Evaluating Strategy: 10min / 60min for NIFTY...
-[2026-07-26 12:34:09] Simulating trades and fetching Option prices for 10min/60min...
-[2026-07-26 12:34:09] 0 trades for 10min/60min.
-[2026-07-26 12:34:09] Processing SENSEX...
-[2026-07-26 12:34:10] Checking GitHub Cache: https://raw.githubusercontent.com/rkovath-netizen/Index_stochastic_intraday/main/data_cache/SENSEX_continuous.csv
-[2026-07-26 12:34:11] GitHub cache is incomplete (ends on 2026-06-25). Forcing fresh API download...
-[2026-07-26 12:34:11] Fetching fresh data from Upstox API...
-[2026-07-26 12:35:06] Failed to fetch base data for SENSEX. Skipping.
-[2026-07-26 12:35:06] Backtest complete! Formatting metrics...
-[2026-07-26 12:35:06] Pushing final results to GitHub...
-[2026-07-26 12:35:08] Successfully created backtest_results/stochastic_momentum_trades_20260726_123506.csv on GitHub.
-[2026-07-26 12:35:09] Successfully created backtest_results/stochastic_momentum_metrics_20260726_123506.csv on GitHub.
-[2026-07-26 12:35:09] --- BACKGROUND BACKTEST FULLY COMPLETE & UPLOADED ---
+[2026-07-26 12:46:11] --- BACKGROUND BACKTEST STARTED FOR 30 DAYS ---
+[2026-07-26 12:46:11] Processing NIFTY...
+[2026-07-26 12:46:13] Checking GitHub Cache: https://raw.githubusercontent.com/rkovath-netizen/Index_stochastic_intraday/main/data_cache/NIFTY_continuous.csv
+[2026-07-26 12:46:13] GitHub cache exists but is too short. Forcing fresh API download...
+[2026-07-26 12:46:13] Fetching fresh data from Upstox API...
+[2026-07-26 12:46:13] Fetching futures chunk for NIFTY: 2026-06-26 to 2026-06-30
+[2026-07-26 12:46:22] WARN: Live API Error 400 for NIFTY on 2026-07-28
+[2026-07-26 12:46:22] WARN: Failed to resolve Future Key for NIFTY on expiry 2026-07-28
+[2026-07-26 12:46:24] WARN: Live API Error 400 for NIFTY on 2026-08-25
+[2026-07-26 12:46:24] WARN: Failed to resolve Future Key for NIFTY on expiry 2026-08-25
+[2026-07-26 12:46:27] WARN: Live API Error 400 for NIFTY on 2026-09-29
+[2026-07-26 12:46:27] WARN: Failed to resolve Future Key for NIFTY on expiry 2026-09-29
+[2026-07-26 12:46:29] WARN: Live API Error 400 for NIFTY on 2026-12-29
+[2026-07-26 12:46:29] WARN: Failed to resolve Future Key for NIFTY on expiry 2026-12-29
+[2026-07-26 12:46:32] WARN: Live API Error 400 for NIFTY on 2027-03-30
+[2026-07-26 12:46:32] WARN: Failed to resolve Future Key for NIFTY on expiry 2027-03-30
+[2026-07-26 12:46:34] WARN: Live API Error 400 for NIFTY on 2027-06-29
+[2026-07-26 12:46:34] WARN: Failed to resolve Future Key for NIFTY on expiry 2027-06-29
+[2026-07-26 12:46:36] WARN: Live API Error 400 for NIFTY on 2027-12-28
+[2026-07-26 12:46:36] WARN: Failed to resolve Future Key for NIFTY on expiry 2027-12-28
+[2026-07-26 12:46:39] WARN: Live API Error 400 for NIFTY on 2028-06-27
+[2026-07-26 12:46:39] WARN: Failed to resolve Future Key for NIFTY on expiry 2028-06-27
+[2026-07-26 12:46:41] WARN: Live API Error 400 for NIFTY on 2028-12-26
+[2026-07-26 12:46:41] WARN: Failed to resolve Future Key for NIFTY on expiry 2028-12-26
+[2026-07-26 12:46:43] WARN: Live API Error 400 for NIFTY on 2029-06-26
+[2026-07-26 12:46:43] WARN: Failed to resolve Future Key for NIFTY on expiry 2029-06-26
+[2026-07-26 12:46:46] WARN: Live API Error 400 for NIFTY on 2029-12-24
+[2026-07-26 12:46:46] WARN: Failed to resolve Future Key for NIFTY on expiry 2029-12-24
+[2026-07-26 12:46:49] WARN: Live API Error 400 for NIFTY on 2030-06-25
+[2026-07-26 12:46:49] WARN: Failed to resolve Future Key for NIFTY on expiry 2030-06-25
+[2026-07-26 12:46:51] WARN: Live API Error 400 for NIFTY on 2030-12-31
+[2026-07-26 12:46:51] WARN: Failed to resolve Future Key for NIFTY on expiry 2030-12-31
+[2026-07-26 12:46:54] WARN: Live API Error 400 for NIFTY on 2031-06-24
+[2026-07-26 12:46:54] WARN: Failed to resolve Future Key for NIFTY on expiry 2031-06-24
+[2026-07-26 12:46:54] Loaded 750 base rows for NIFTY.
+[2026-07-26 12:46:54] Caching new NIFTY continuous data to GitHub...
+[2026-07-26 12:46:56] Successfully updated data_cache/NIFTY_continuous.csv on GitHub.
+[2026-07-26 12:46:56] Evaluating Strategy: 3min / 15min for NIFTY...
+[2026-07-26 12:47:01] Simulating trades and fetching Option prices for 3min/15min...
+[2026-07-26 12:47:03] Found 1 trades for 3min/15min.
+[2026-07-26 12:47:03] Evaluating Strategy: 5min / 30min for NIFTY...
+[2026-07-26 12:47:03] Simulating trades and fetching Option prices for 5min/30min...
+[2026-07-26 12:47:04] Found 1 trades for 5min/30min.
+[2026-07-26 12:47:04] Evaluating Strategy: 10min / 60min for NIFTY...
+[2026-07-26 12:47:04] Simulating trades and fetching Option prices for 10min/60min...
+[2026-07-26 12:47:04] 0 trades for 10min/60min.
+[2026-07-26 12:47:04] Processing SENSEX...
+[2026-07-26 12:47:05] Checking GitHub Cache: https://raw.githubusercontent.com/rkovath-netizen/Index_stochastic_intraday/main/data_cache/SENSEX_continuous.csv
+[2026-07-26 12:47:06] GitHub cache is incomplete (ends on 2026-06-25). Forcing fresh API download...
+[2026-07-26 12:47:06] Fetching fresh data from Upstox API...
+[2026-07-26 12:47:08] WARN: Live API Error 400 for SENSEX on 2026-07-30
+[2026-07-26 12:47:08] WARN: Failed to resolve Future Key for SENSEX on expiry 2026-07-30
+[2026-07-26 12:47:11] WARN: Live API Error 400 for SENSEX on 2026-08-27
+[2026-07-26 12:47:11] WARN: Failed to resolve Future Key for SENSEX on expiry 2026-08-27
+[2026-07-26 12:47:13] WARN: Live API Error 400 for SENSEX on 2026-09-24
+[2026-07-26 12:47:13] WARN: Failed to resolve Future Key for SENSEX on expiry 2026-09-24
+[2026-07-26 12:47:15] WARN: Live API Error 400 for SENSEX on 2026-12-31
+[2026-07-26 12:47:15] WARN: Failed to resolve Future Key for SENSEX on expiry 2026-12-31
+[2026-07-26 12:47:18] WARN: Live API Error 400 for SENSEX on 2027-03-25
+[2026-07-26 12:47:18] WARN: Failed to resolve Future Key for SENSEX on expiry 2027-03-25
+[2026-07-26 12:47:20] WARN: Live API Error 400 for SENSEX on 2027-06-24
+[2026-07-26 12:47:20] WARN: Failed to resolve Future Key for SENSEX on expiry 2027-06-24
+[2026-07-26 12:47:23] WARN: Live API Error 400 for SENSEX on 2027-12-30
+[2026-07-26 12:47:23] WARN: Failed to resolve Future Key for SENSEX on expiry 2027-12-30
+[2026-07-26 12:47:25] WARN: Live API Error 400 for SENSEX on 2028-06-29
+[2026-07-26 12:47:25] WARN: Failed to resolve Future Key for SENSEX on expiry 2028-06-29
+[2026-07-26 12:47:27] WARN: Live API Error 400 for SENSEX on 2028-12-28
+[2026-07-26 12:47:27] WARN: Failed to resolve Future Key for SENSEX on expiry 2028-12-28
+[2026-07-26 12:47:30] WARN: Live API Error 400 for SENSEX on 2029-06-28
+[2026-07-26 12:47:30] WARN: Failed to resolve Future Key for SENSEX on expiry 2029-06-28
+[2026-07-26 12:47:32] WARN: Live API Error 400 for SENSEX on 2029-12-27
+[2026-07-26 12:47:32] WARN: Failed to resolve Future Key for SENSEX on expiry 2029-12-27
+[2026-07-26 12:47:34] WARN: Live API Error 400 for SENSEX on 2030-06-27
+[2026-07-26 12:47:34] WARN: Failed to resolve Future Key for SENSEX on expiry 2030-06-27
+[2026-07-26 12:47:37] WARN: Live API Error 400 for SENSEX on 2030-12-26
+[2026-07-26 12:47:37] WARN: Failed to resolve Future Key for SENSEX on expiry 2030-12-26
+[2026-07-26 12:47:39] WARN: Live API Error 400 for SENSEX on 2031-06-26
+[2026-07-26 12:47:39] WARN: Failed to resolve Future Key for SENSEX on expiry 2031-06-26
+[2026-07-26 12:47:39] CRITICAL ERROR: The API returned 0 total futures rows for SENSEX. Continuous chart is empty.
+[2026-07-26 12:47:39] Failed to fetch base data for SENSEX. Skipping.
+[2026-07-26 12:47:39] Backtest complete! Formatting metrics...
+[2026-07-26 12:47:39] Pushing final results to GitHub...
+[2026-07-26 12:47:41] Successfully created backtest_results/stochastic_momentum_trades_20260726_124739.csv on GitHub.
+[2026-07-26 12:47:43] Successfully created backtest_results/stochastic_momentum_metrics_20260726_124739.csv on GitHub.
+[2026-07-26 12:47:43] --- BACKGROUND BACKTEST FULLY COMPLETE & UPLOADED ---
