@@ -2,7 +2,8 @@
 STRATEGY: Stochastic Index Intraday Momentum (Methodical API-Driven Edition)
 --------------------------------------------------
 MODULES:
-- Explicit Instrument Verification: Logs exact Trading Symbol and Key to verify BSE_FO mapping.
+- Sensex 50 Contamination Block: Explicitly prevents SENSEX50 derivatives from mixing with SENSEX (30).
+- Explicit Instrument Verification: Logs exact Trading Symbol and Key.
 - Automatic Timeframe Fallback: Dynamically scales from 1-min -> 3-min -> 5-min if futures are illiquid.
 - Transparent Data Logging: Exposes Upstox API empty responses.
 - Official Expiry Endpoint Parsing: Fetches exact exchange-approved expiry dates from Upstox.
@@ -34,7 +35,6 @@ TIMEFRAME_COMBOS = [
     ('10min', '60min')
 ]
 
-# Explicitly maps SENSEX to the BSE_FO segment to prevent NSE contamination
 INDEX_CONFIG = {
     "NIFTY": {"underlying": "NSE_INDEX|Nifty 50", "step": 50, "segment": "NSE_FO"},
     "SENSEX": {"underlying": "BSE_INDEX|SENSEX", "step": 100, "segment": "BSE_FO"}
@@ -54,14 +54,24 @@ def is_exact_symbol(tsym, symbol):
     tsym = str(tsym).upper().strip()
     symbol = symbol.upper()
     
+    # CRITICAL FIX: SENSEX vs SENSEX50 Contamination
     if symbol == "SENSEX":
-        if tsym.startswith("BSX") or tsym.startswith("SENSEX"):
-            return True
-        return False
-        
-    if not tsym.startswith(symbol): return False
+        if tsym.startswith("SENSEX50"): 
+            return False # Explicitly block Sensex 50 contracts
+            
+        if tsym.startswith("BSX"):
+            symbol = "BSX"
+        elif tsym.startswith("SENSEX"):
+            symbol = "SENSEX"
+        else:
+            return False
+    else:
+        if not tsym.startswith(symbol): return False
+    
     if len(tsym) > len(symbol):
-        if tsym[len(symbol)].isalpha(): return False
+        next_char = tsym[len(symbol)]
+        if next_char.isalpha():
+            return False
     return True
 
 def get_live_instruments():
@@ -141,7 +151,6 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
         # --- LIVE RUNNING CONTRACTS VIA MASTER CSV ---
         df = get_live_instruments()
         if not df.empty:
-            # We strictly enforce the segment from INDEX_CONFIG to ensure we don't cross NSE/BSE boundaries
             segment = INDEX_CONFIG[symbol]["segment"]
             subset = df[(df['expiry'] == expiry_date_str) & (df['instrument_type'] == inst_type) & (df['exchange'] == segment)]
             
