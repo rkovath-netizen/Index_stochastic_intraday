@@ -2,10 +2,9 @@
 STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
 MODULES:
+- Strict Symbol Matching: Hardened boundaries prevent NIFTYFIN/BANKNIFTY contamination.
 - GitHub/Local Caching: Checks for CSV files on GitHub to bypass API timeouts.
 - Timezone Normalization: Strips tz-aware metadata for smooth date comparisons.
-- Strict Expiry Matching: Prevents FINNIFTY/BANKNIFTY contamination.
-- Robust Options Resolution: Safely ignores spaces in historical Upstox symbols.
 - Precise Option OHLC Polling: Sorts candles chronologically.
 - Safety Catch: Gracefully handles missing data to prevent KeyErrors.
 """
@@ -47,6 +46,23 @@ def robust_api_get(url, headers, max_retries=3, params=None):
         else: time.sleep(1)
     return res
 
+def is_exact_symbol(tsym, symbol):
+    """
+    Ensures 'NIFTY' only matches NIFTY, and prevents it from matching 'NIFTYFIN' 
+    or 'NIFTYMIDSELECT' by checking the boundary character.
+    """
+    tsym = str(tsym).upper().strip()
+    symbol = symbol.upper()
+    if not tsym.startswith(symbol): return False
+    
+    # If there are characters after the symbol, the immediate next one CANNOT be a letter.
+    # It must be a digit (like NIFTY26JUL) or a space (NIFTY 26 JUL)
+    if len(tsym) > len(symbol):
+        next_char = tsym[len(symbol)]
+        if next_char.isalpha():
+            return False
+    return True
+
 # ==========================================
 # MODULE 2: EXPIRY & CONTRACT RESOLUTION
 # ==========================================
@@ -68,8 +84,8 @@ def get_all_expiries(symbol, token):
         with gzip.open(io.BytesIO(res_csv.content), 'rt', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                tsym = row.get('tradingsymbol', '').upper()
-                if tsym.startswith(symbol) and row.get('expiry'):
+                tsym = row.get('tradingsymbol', '')
+                if is_exact_symbol(tsym, symbol) and row.get('expiry'):
                     available_expiries.add(row.get('expiry'))
                     
     return sorted(list(available_expiries))
@@ -111,9 +127,15 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
             target_suffix = f"{int(strike)}{opt_type}" if inst_type == "OPTIDX" else "FUT"
             
             for c in contracts:
-                # FIX: Strip all spaces to match older Upstox formatting variants
-                tsym_clean = str(c.get("trading_symbol", "")).upper().replace(" ", "")
-                if tsym_clean.startswith(symbol) and tsym_clean.endswith(target_suffix):
+                tsym_raw = str(c.get("trading_symbol", ""))
+                
+                # STRICT BOUNDARY: Prevent contamination
+                if not is_exact_symbol(tsym_raw, symbol):
+                    continue
+                
+                # STRIP SPACES: To handle older Upstox formatting variants
+                tsym_clean = tsym_raw.upper().replace(" ", "")
+                if tsym_clean.endswith(target_suffix):
                     return c.get("instrument_key")
                     
             if logger and inst_type == "OPTIDX":
@@ -158,35 +180,43 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
             res = requests.get(raw_url, timeout=15)
             if res.status_code == 200:
                 df = pd.read_csv(io.StringIO(res.text))
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                df.set_index('timestamp', inplace=True)
                 
-                # CRITICAL FIX: Strip timezone awareness from the index before comparing
-                if df.index.tz is not None:
-                    df.index = df.index.tz_localize(None)
-                
-                if df.index.min() <= pd.to_datetime(start_date_str):
-                    df = df[df.index >= pd.to_datetime(start_date_str)]
-                    if logger: logger(f"Successfully loaded {len(df)} rows from GitHub cache.")
-                    return df, all_expiries, False
+                if df.empty:
+                    if logger: logger("GitHub cache is empty. Forcing fresh API download...")
                 else:
-                    if logger: logger(f"GitHub cache exists but is too short. Rebuilding via API.")
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df.set_index('timestamp', inplace=True)
+                    
+                    if df.index.tz is not None:
+                        df.index = df.index.tz_localize(None)
+                    
+                    if df.index.min() <= pd.to_datetime(start_date_str):
+                        df = df[df.index >= pd.to_datetime(start_date_str)]
+                        
+                        if not df.empty:
+                            if logger: logger(f"Successfully loaded {len(df)} rows from GitHub cache.")
+                            return df, all_expiries, False
+                        else:
+                            if logger: logger("Filtered cache resulted in 0 rows. Forcing fresh API download...")
+                    else:
+                        if logger: logger("GitHub cache exists but is too short. Forcing fresh API download...")
         except Exception as e:
             if logger: logger(f"GitHub cache load failed: {e}")
 
+    # Fallback to local server cache if GitHub cache failed
     local_filename = f"{symbol}_continuous.csv"
     if os.path.exists(local_filename):
         df = pd.read_csv(local_filename)
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df.set_index('timestamp', inplace=True)
-        
-        # CRITICAL FIX: Strip timezone awareness
-        if df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-            
-        if df.index.min() <= pd.to_datetime(start_date_str):
-            df = df[df.index >= pd.to_datetime(start_date_str)]
-            return df, all_expiries, False
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df.set_index('timestamp', inplace=True)
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+                
+            if df.index.min() <= pd.to_datetime(start_date_str):
+                df = df[df.index >= pd.to_datetime(start_date_str)]
+                if not df.empty:
+                    return df, all_expiries, False
 
     if logger: logger(f"Fetching fresh data from Upstox API...")
     monthly_expiries = get_monthly_expiries(all_expiries)
