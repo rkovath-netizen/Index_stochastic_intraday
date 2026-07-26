@@ -1,0 +1,3 @@
+Entry_Time,Symbol,TF_Combo,Trade_Type,Weekly_Expiry,Future_Price,Sell_Leg,Buy_Leg,Sell_Entry_Price,Buy_Entry_Price,Net_Credit_Received,Stop_Loss,Take_Profit_Target
+2026-06-30 09:45,NIFTY,3min/15min,Bear Call Spread,2026-06-30,23875.0,23900 CE,24000 CE,57.45,26.6,30.85,66.07,9.26
+2026-06-30 15:00,NIFTY,5min/30min,Bear Call Spread,2026-06-30,23853.4,23850 CE,23950 CE,17.2,0.65,16.55,19.78,4.96
