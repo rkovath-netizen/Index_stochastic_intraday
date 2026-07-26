@@ -5,6 +5,7 @@ MODULES:
 - Strict Symbol Matching: Hardened boundaries prevent NIFTYFIN/BANKNIFTY contamination.
 - GitHub/Local Caching: Checks for CSV files on GitHub to bypass API timeouts.
 - Timezone Normalization: Strips tz-aware metadata for smooth date comparisons.
+- Future Resolution: Safely handles BSE symbol formats without requiring "FUT" suffixes.
 - Precise Option OHLC Polling: Sorts candles chronologically.
 - Safety Catch: Gracefully handles missing data to prevent KeyErrors.
 """
@@ -55,8 +56,6 @@ def is_exact_symbol(tsym, symbol):
     symbol = symbol.upper()
     if not tsym.startswith(symbol): return False
     
-    # If there are characters after the symbol, the immediate next one CANNOT be a letter.
-    # It must be a digit (like NIFTY26JUL) or a space (NIFTY 26 JUL)
     if len(tsym) > len(symbol):
         next_char = tsym[len(symbol)]
         if next_char.isalpha():
@@ -115,7 +114,10 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
         res = robust_api_get("https://api.upstox.com/v2/instruments/search", headers, params=search_params)
         if res and res.status_code == 200:
             data = res.json().get('data', [])
-            if data: return data[0].get('instrument_key')
+            for c in data:
+                tsym_raw = str(c.get("trading_symbol", ""))
+                if is_exact_symbol(tsym_raw, symbol):
+                    return c.get('instrument_key')
     else:
         api_type = "option" if inst_type == "OPTIDX" else "future"
         underlying = INDEX_CONFIG[symbol]["underlying"]
@@ -124,7 +126,7 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
         
         if res and res.status_code == 200:
             contracts = res.json().get("data", [])
-            target_suffix = f"{int(strike)}{opt_type}" if inst_type == "OPTIDX" else "FUT"
+            target_suffix = f"{int(strike)}{opt_type}" if inst_type == "OPTIDX" else ""
             
             for c in contracts:
                 tsym_raw = str(c.get("trading_symbol", ""))
@@ -133,7 +135,11 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                 if not is_exact_symbol(tsym_raw, symbol):
                     continue
                 
-                # STRIP SPACES: To handle older Upstox formatting variants
+                # CRITICAL FIX: Since the API only returned Futures, we don't need to check for a "FUT" suffix
+                if inst_type == "FUTIDX":
+                    return c.get("instrument_key")
+                
+                # For options, check the suffix
                 tsym_clean = tsym_raw.upper().replace(" ", "")
                 if tsym_clean.endswith(target_suffix):
                     return c.get("instrument_key")
@@ -203,7 +209,6 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
         except Exception as e:
             if logger: logger(f"GitHub cache load failed: {e}")
 
-    # Fallback to local server cache if GitHub cache failed
     local_filename = f"{symbol}_continuous.csv"
     if os.path.exists(local_filename):
         df = pd.read_csv(local_filename)
