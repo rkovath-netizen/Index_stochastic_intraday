@@ -2,13 +2,11 @@
 STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
 MODULES:
-- Live CSV Master Database: Replaces the finicky Upstox '/search' API for live contracts, guaranteeing 100% resolution of future expiries.
+- Sensex X-Ray Logging: Dumps raw BSE contract names into the log for forensic analysis.
+- Live CSV Master Database: Replaces the Search API for 100% resolution of future expiries.
 - Micro-Delays: Bypasses Upstox silent rate-limiting on historical chunks.
 - 2-Day Chunking: Guarantees payloads never exceed API memory limits.
-- Sensex Alias Resolution: Automatically recognizes BSE's "BSX" naming convention.
 - Advanced Option Resolution: Dynamically matches strikes anywhere in the string.
-- Strict Symbol Matching: Hardened boundaries prevent NIFTYFIN contamination.
-- GitHub/Local Caching: Validates completeness before loading.
 """
 
 import os
@@ -54,9 +52,15 @@ def is_exact_symbol(tsym, symbol):
     tsym = str(tsym).upper().strip()
     symbol = symbol.upper()
     
-    if symbol == "SENSEX" and tsym.startswith("BSX"):
-        symbol = "BSX"
-        
+    # Catch both SENSEX and BSX aliases for BSE contracts
+    if symbol == "SENSEX":
+        if tsym.startswith("BSX"):
+            symbol = "BSX"
+        elif tsym.startswith("SENSEX"):
+            symbol = "SENSEX"
+        else:
+            return False
+            
     if not tsym.startswith(symbol): return False
     
     if len(tsym) > len(symbol):
@@ -66,7 +70,6 @@ def is_exact_symbol(tsym, symbol):
     return True
 
 def get_live_instruments():
-    """Downloads and caches the Upstox Master Database to bypass the Search API"""
     global _LIVE_INSTRUMENTS_CACHE
     if _LIVE_INSTRUMENTS_CACHE is not None:
         return _LIVE_INSTRUMENTS_CACHE
@@ -140,7 +143,7 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
     today_dt = datetime.now(IST).date()
     
     if expiry_dt >= today_dt:
-        # --- BYPASS SEARCH API: USE MASTER CSV ---
+        # --- LIVE API SEARCH ---
         df = get_live_instruments()
         if not df.empty:
             subset = df[(df['expiry'] == expiry_date_str) & (df['instrument_type'] == inst_type)]
@@ -156,7 +159,10 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                     if match and float(match.group(1)) == float(strike):
                         return str(row.get("instrument_key"))
                         
-        if logger: logger(f"WARN: Live CSV Master missed {symbol} {inst_type} on {expiry_date_str}.")
+            # DEEP X-RAY LOGGING FOR LIVE CONTRACTS
+            if logger: 
+                raw_symbols = subset['tradingsymbol'].head(20).tolist()
+                logger(f"[X-RAY LIVE API] Failed to resolve {symbol} {inst_type} on {expiry_date_str}. Raw Upstox symbols available: {raw_symbols}")
     else:
         # --- EXPIRED API SEARCH ---
         api_type = "option" if inst_type == "OPTIDX" else "future"
@@ -178,8 +184,12 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                     if match and float(match.group(1)) == float(strike):
                         return c.get("instrument_key")
                         
-            if logger and inst_type == "OPTIDX":
-                logger(f"WARN: Expired API missed {symbol} {strike}{opt_type} on {expiry_date_str}.")
+            # DEEP X-RAY LOGGING FOR EXPIRED CONTRACTS
+            if logger:
+                raw_symbols = [c.get("trading_symbol") for c in contracts[:20]]
+                logger(f"[X-RAY EXPIRED API] Failed to resolve {symbol} {inst_type} on {expiry_date_str}. Raw Upstox symbols returned: {raw_symbols}")
+        elif logger:
+            logger(f"[X-RAY HTTP ERROR] Upstox returned Status {res.status_code if res else 'None'} for {symbol} on {expiry_date_str}")
                 
     return None
 
@@ -233,7 +243,7 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
     all_expiries = get_all_expiries(symbol, token, logger=logger)
     
     if not all_expiries:
-        if logger: logger(f"CRITICAL: 0 expiries found for {symbol}.")
+        if logger: logger(f"CRITICAL: 0 expiries found for {symbol}. Exiting.")
         return pd.DataFrame(), [], False
     
     if github_repo:
@@ -250,11 +260,7 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
                     if df.index.min() <= pd.to_datetime(start_date_str):
                         if df.index.max() >= pd.to_datetime(today_str) - timedelta(days=5):
                             df = df[df.index >= pd.to_datetime(start_date_str)]
-                            if not df.empty:
-                                if logger: logger(f"Successfully loaded {len(df)} rows from GitHub cache.")
-                                return df, all_expiries, False
-                        else:
-                            if logger: logger(f"GitHub cache is incomplete (ends on {df.index.max().date()}). Forcing fresh API download...")
+                            if not df.empty: return df, all_expiries, False
         except Exception as e: pass
 
     local_filename = f"{symbol}_continuous.csv"
@@ -280,7 +286,7 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
     for exp in relevant_expiries:
         future_key = resolve_exact_contract(symbol, exp, token, inst_type="FUTIDX", logger=logger)
         if not future_key: 
-            if logger: logger(f"WARN: Failed to resolve Future Key for {symbol} on expiry {exp}")
+            if logger: logger(f"WARN: Engine completely failed to locate a Future Key for {symbol} on expiry {exp}")
             continue
         
         end_fetch = min(exp, today_str)
@@ -385,7 +391,9 @@ def simulate_trades(df, symbol, ltf_str, htf_str, token, all_expiries, logger=No
             future_price = row['close']
             
             weekly_expiry = get_closest_weekly_expiry(all_expiries, entry_date)
-            if not weekly_expiry: continue
+            if not weekly_expiry: 
+                if logger: logger(f"[{entry_dt_str}] No valid weekly expiry found for {symbol}.")
+                continue
             
             atm_strike = round(future_price / step) * step
             is_long = row['long_signal']
