@@ -6,6 +6,7 @@ MODULES:
 - Continuous Futures Builder: Stitches front-month futures history.
 - Strict Expiry Matching: Prevents FINNIFTY/BANKNIFTY contamination.
 - Precise Option OHLC Polling: Sorts candles chronologically to grab exact minute pricing.
+- Safety Catch: Gracefully handles missing data to prevent KeyErrors.
 """
 
 import os
@@ -145,7 +146,6 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo=""):
     start_dt = datetime.strptime(start_date_str, '%Y-%m-%d').date()
     all_expiries = get_all_expiries(symbol, token)
     
-    # 1. TRY GITHUB RAW URL CACHE (FASTEST - Prevents phone timeouts)
     if github_repo:
         raw_url = f"https://raw.githubusercontent.com/{github_repo}/main/data_cache/{symbol}_continuous.csv"
         print(f"[ENGINE] Checking GitHub Cache: {raw_url}")
@@ -161,12 +161,9 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo=""):
                     df = df[df.index >= pd.to_datetime(start_date_str)]
                     print(f"[ENGINE] Successfully loaded {len(df)} rows from GitHub cache.")
                     return df, all_expiries, False
-                else:
-                    print("[ENGINE] GitHub cache exists but is too short. Need API fetch.")
         except Exception as e:
             print(f"[ENGINE] GitHub cache load failed: {e}")
 
-    # 2. TRY LOCAL SERVER CACHE
     local_filename = f"{symbol}_continuous.csv"
     if os.path.exists(local_filename):
         print(f"[ENGINE] Loading local cache: {local_filename}")
@@ -177,7 +174,6 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo=""):
             df = df[df.index >= pd.to_datetime(start_date_str)]
             return df, all_expiries, False
 
-    # 3. FALLBACK TO API STITCHING (SLOW)
     print(f"[ENGINE] Fetching fresh data from Upstox API...")
     monthly_expiries = get_monthly_expiries(all_expiries)
     relevant_expiries = [e for e in monthly_expiries if datetime.strptime(e, '%Y-%m-%d').date() >= start_dt]
@@ -258,19 +254,32 @@ def calculate_strategy_indicators(ltf, htf):
     return ltf, htf
 
 def generate_signals(ltf, htf):
+    # --- SAFETY CATCH: Prevent KeyErrors if indicators failed to calculate ---
     required_htf_cols = ['ema_25', 'htf_stoch_k', 'htf_stoch_d', 'obv', 'obv_sma_20']
+    for col in required_htf_cols:
+        if col not in htf.columns:
+            htf[col] = 0.0  # Fallback to prevent crash
+            
+    required_ltf_cols = ['stoch_cross_up', 'stoch_cross_down']
+    for col in required_ltf_cols:
+        if col not in ltf.columns:
+            ltf[col] = False # Fallback to prevent crash
+    # -------------------------------------------------------------------------
+
     htf_aligned = htf[[c for c in required_htf_cols if c in htf.columns]].reindex(ltf.index, method='ffill').fillna(0)
     df = ltf.join(htf_aligned)
     
     df['htf_long_bias'] = (df['close'] > df['ema_25']) & (df['htf_stoch_k'] > df['htf_stoch_d']) & (df['obv'] > df['obv_sma_20'])
     df['htf_short_bias'] = (df['close'] < df['ema_25']) & (df['htf_stoch_k'] < df['htf_stoch_d']) & (df['obv'] < df['obv_sma_20'])
-    df['vol_surge'] = (df['vol'] > df['vol'].shift(1)) & (df['vol'] > df['vol'].shift(2))
     
-    if 'stoch_cross_up' in df.columns:
-        df['long_signal'] = (df['close'] > df['open']) & df['stoch_cross_up'].shift(1).fillna(False) & df['vol_surge'] & df['htf_long_bias']
-        df['short_signal'] = (df['close'] < df['open']) & df['stoch_cross_down'].shift(1).fillna(False) & df['vol_surge'] & df['htf_short_bias']
+    # Safely calculate volume surge
+    if 'vol' in df.columns:
+        df['vol_surge'] = (df['vol'] > df['vol'].shift(1)) & (df['vol'] > df['vol'].shift(2))
     else:
-        df['long_signal'], df['short_signal'] = False, False
+        df['vol_surge'] = False
+    
+    df['long_signal'] = (df['close'] > df['open']) & df['stoch_cross_up'].shift(1).fillna(False) & df['vol_surge'] & df['htf_long_bias']
+    df['short_signal'] = (df['close'] < df['open']) & df['stoch_cross_down'].shift(1).fillna(False) & df['vol_surge'] & df['htf_short_bias']
         
     return df.dropna()
 
