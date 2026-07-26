@@ -2,12 +2,11 @@
 STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
 MODULES:
-- Data Chunking: Splits large API requests into 5-day chunks to prevent Upstox truncation.
-- Sensex Alias Resolution: Automatically recognizes BSE's "BSX" naming convention.
+- Micro-Delays: Bypasses Upstox silent rate-limiting on historical chunks.
+- 2-Day Chunking: Guarantees payloads never exceed API memory limits.
+- X-Ray Logging: Dumps raw API responses if futures fail to resolve.
 - Advanced Option Resolution: Dynamically matches strikes anywhere in the string.
 - Strict Symbol Matching: Hardened boundaries prevent NIFTYFIN contamination.
-- GitHub/Local Caching: Validates completeness before loading.
-- Precise Option OHLC Polling: Sorts candles chronologically.
 """
 
 import os
@@ -43,15 +42,14 @@ def robust_api_get(url, headers, max_retries=3, params=None):
     for attempt in range(max_retries):
         res = requests.get(url, headers=headers, params=params)
         if res.status_code == 200: return res
-        elif res.status_code == 429: time.sleep(2 ** attempt) 
-        else: time.sleep(1)
+        elif res.status_code == 429: time.sleep(1 + attempt) 
+        else: time.sleep(0.5)
     return res
 
 def is_exact_symbol(tsym, symbol):
     tsym = str(tsym).upper().strip()
     symbol = symbol.upper()
     
-    # CRITICAL FIX: Handle Bombay Stock Exchange alias for Sensex
     if symbol == "SENSEX" and tsym.startswith("BSX"):
         symbol = "BSX"
         
@@ -111,7 +109,7 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
     
     if expiry_dt >= today_dt:
         query = f"{symbol}"
-        if symbol == "SENSEX": query = "BSX" # Optimize live search for BSE
+        if symbol == "SENSEX": query = "BSX"
         if strike: query += f" {int(strike)}"
         search_params = {"query": query, "segments": segment, "instrument_types": inst_type if not opt_type else opt_type, "expiry": expiry_date_str}
         res = robust_api_get("https://api.upstox.com/v2/instruments/search", headers, params=search_params)
@@ -133,6 +131,8 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
             if logger: 
                 sample_symbols = [c.get("trading_symbol") for c in data[:5]]
                 logger(f"WARN: Live API missed {symbol} {target_suffix} on {expiry_date_str}. Samples: {sample_symbols}")
+        elif logger:
+            logger(f"WARN: Live API Error {res.status_code} for {symbol} on {expiry_date_str}")
     else:
         api_type = "option" if inst_type == "OPTIDX" else "future"
         underlying = INDEX_CONFIG[symbol]["underlying"]
@@ -155,18 +155,16 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                         
             if logger:
                 sample_symbols = [c.get("trading_symbol") for c in contracts[:5]]
-                logger(f"WARN: Expired API missed {symbol} {target_suffix} on {expiry_date_str}. Samples: {sample_symbols}")
+                logger(f"WARN: Expired API missed {symbol} {target_suffix} on {expiry_date_str}. Contracts returned: {len(contracts)}. Samples: {sample_symbols}")
+        elif logger:
+            logger(f"WARN: Expired API Error {res.status_code} for {symbol} on {expiry_date_str}")
                 
     return None
 
 # ==========================================
 # MODULE 3: DATA FETCHING & GITHUB CACHING
 # ==========================================
-def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1minute'):
-    """
-    CRITICAL FIX: Fetches data in 5-day chunks to prevent the Upstox API 
-    from truncating large historical requests.
-    """
+def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1minute', logger=None):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     encoded_key = urllib.parse.quote(instrument_key)
     
@@ -177,7 +175,8 @@ def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1min
     current = start_dt
     
     while current <= end_dt:
-        chunk_end = min(current + timedelta(days=5), end_dt)
+        # CRITICAL FIX: 2-Day Chunks to bypass silent truncation
+        chunk_end = min(current + timedelta(days=2), end_dt)
         str_from = current.strftime('%Y-%m-%d')
         str_to = chunk_end.strftime('%Y-%m-%d')
         
@@ -187,6 +186,8 @@ def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1min
         
         if res and res.status_code == 200:
             chunk_candles = res.json().get('data', {}).get('candles', [])
+        elif res and res.status_code != 200 and logger:
+            logger(f"API Error {res.status_code} fetching chunk {str_from} to {str_to}")
             
         if not chunk_candles:
             url_expired = f"https://api.upstox.com/v2/expired-instruments/historical-candle/{encoded_key}/{interval}/{str_to}/{str_from}"
@@ -198,6 +199,7 @@ def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1min
             all_candles.extend(chunk_candles)
             
         current = chunk_end + timedelta(days=1)
+        time.sleep(0.2) # CRITICAL FIX: Micro-delay prevents rate-limiting
             
     if not all_candles: return pd.DataFrame()
     
@@ -210,6 +212,10 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
     today_str = datetime.now(IST).strftime('%Y-%m-%d')
     start_dt = datetime.strptime(start_date_str, '%Y-%m-%d').date()
     all_expiries = get_all_expiries(symbol, token)
+    
+    if not all_expiries:
+        if logger: logger(f"CRITICAL: 0 expiries found for {symbol}. API might be down or key is wrong.")
+        return pd.DataFrame(), [], False
     
     if github_repo:
         raw_url = f"https://raw.githubusercontent.com/{github_repo}/main/data_cache/{symbol}_continuous.csv"
@@ -260,18 +266,27 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
     monthly_expiries = get_monthly_expiries(all_expiries)
     relevant_expiries = [e for e in monthly_expiries if datetime.strptime(e, '%Y-%m-%d').date() >= start_dt]
     
+    if not relevant_expiries and logger:
+        logger(f"CRITICAL: 0 relevant expiries for {symbol} after {start_date_str}.")
+    
     continuous_df = pd.DataFrame()
     current_start = start_date_str
     
     for exp in relevant_expiries:
         future_key = resolve_exact_contract(symbol, exp, token, inst_type="FUTIDX", logger=logger)
-        if not future_key: continue
+        if not future_key: 
+            if logger: logger(f"WARN: Failed to resolve Future Key for {symbol} on expiry {exp}")
+            continue
         
         end_fetch = min(exp, today_str)
-        df = fetch_candle_chunk(future_key, current_start, end_fetch, token)
+        if logger: logger(f"Fetching futures chunk for {symbol}: {current_start} to {end_fetch}")
+        
+        df = fetch_candle_chunk(future_key, current_start, end_fetch, token, logger=logger)
         
         if not df.empty:
             continuous_df = pd.concat([continuous_df, df])
+        else:
+            if logger: logger(f"WARN: 0 candles returned for {symbol} chunk {current_start} to {end_fetch}")
             
         current_start = (datetime.strptime(exp, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
         if current_start > today_str:
@@ -282,6 +297,8 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
         try:
             continuous_df.to_csv(local_filename)
         except: pass
+    elif logger:
+        logger(f"CRITICAL ERROR: The API returned 0 total futures rows for {symbol}. Continuous chart is empty.")
         
     return continuous_df, all_expiries, True
 
