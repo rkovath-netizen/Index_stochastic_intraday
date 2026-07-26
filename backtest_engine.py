@@ -1,12 +1,7 @@
 """
 STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
-MODULES:
-- Micro-Delays: Bypasses Upstox silent rate-limiting on historical chunks.
-- 2-Day Chunking: Guarantees payloads never exceed API memory limits.
-- X-Ray Logging: Dumps raw API responses if futures fail to resolve.
-- Advanced Option Resolution: Dynamically matches strikes anywhere in the string.
-- Strict Symbol Matching: Hardened boundaries prevent NIFTYFIN contamination.
+MODULES: Deep Diagnostic Mode Enabled.
 """
 
 import os
@@ -22,16 +17,9 @@ import time
 import re
 import pytz
 
-# ==========================================
-# MODULE 1: CONSTANTS & CONFIGURATION
-# ==========================================
 IST = pytz.timezone('Asia/Kolkata')
 
-TIMEFRAME_COMBOS = [
-    ('3min', '15min'),
-    ('5min', '30min'),
-    ('10min', '60min')
-]
+TIMEFRAME_COMBOS = [('3min', '15min'), ('5min', '30min'), ('10min', '60min')]
 
 INDEX_CONFIG = {
     "NIFTY": {"underlying": "NSE_INDEX|Nifty 50", "step": 50, "segment": "NSE_FO"},
@@ -49,42 +37,42 @@ def robust_api_get(url, headers, max_retries=3, params=None):
 def is_exact_symbol(tsym, symbol):
     tsym = str(tsym).upper().strip()
     symbol = symbol.upper()
-    
-    if symbol == "SENSEX" and tsym.startswith("BSX"):
-        symbol = "BSX"
-        
+    if symbol == "SENSEX" and tsym.startswith("BSX"): symbol = "BSX"
     if not tsym.startswith(symbol): return False
-    
     if len(tsym) > len(symbol):
-        next_char = tsym[len(symbol)]
-        if next_char.isalpha():
-            return False
+        if tsym[len(symbol)].isalpha(): return False
     return True
 
-# ==========================================
-# MODULE 2: EXPIRY & CONTRACT RESOLUTION
-# ==========================================
-def get_all_expiries(symbol, token):
+def get_all_expiries(symbol, token, logger=None):
+    if logger: logger(f"[DEBUG] Fetching expiries for {symbol}...")
     available_expiries = set()
     underlying_key = INDEX_CONFIG[symbol]["underlying"]
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     
     url = "https://api.upstox.com/v2/expired-instruments/expiries"
     res = robust_api_get(url, headers, params={"instrument_key": underlying_key})
+    
     if res and res.status_code == 200:
-        for d in res.json().get("data", []):
+        data = res.json().get("data", [])
+        if logger: logger(f"[DEBUG] Expired API returned {len(data)} total expiries for underlying {underlying_key}.")
+        for d in data:
             if isinstance(d, str): available_expiries.add(d)
             elif isinstance(d, dict) and "expiry_date" in d: available_expiries.add(d["expiry_date"])
+    else:
+        if logger: logger(f"[DEBUG] Expired Expiry API failed with status: {res.status_code if res else 'None'}")
     
     url_csv = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
     res_csv = requests.get(url_csv)
     if res_csv.status_code == 200:
         with gzip.open(io.BytesIO(res_csv.content), 'rt', encoding='utf-8') as f:
             reader = csv.DictReader(f)
+            csv_matches = 0
             for row in reader:
                 tsym = row.get('tradingsymbol', '')
                 if is_exact_symbol(tsym, symbol) and row.get('expiry'):
                     available_expiries.add(row.get('expiry'))
+                    csv_matches += 1
+        if logger: logger(f"[DEBUG] CSV Master File returned {csv_matches} active contracts matching {symbol}.")
                     
     return sorted(list(available_expiries))
 
@@ -119,20 +107,11 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
             for c in data:
                 tsym_raw = str(c.get("trading_symbol", ""))
                 if not is_exact_symbol(tsym_raw, symbol): continue
-                
-                if inst_type == "FUTIDX":
-                    return c.get('instrument_key')
-                    
+                if inst_type == "FUTIDX": return c.get('instrument_key')
                 if inst_type == "OPTIDX":
                     match = re.search(rf'(\d+(?:\.\d+)?)\s*{opt_type}', tsym_raw.upper())
                     if match and float(match.group(1)) == float(strike):
                         return c.get("instrument_key")
-                        
-            if logger: 
-                sample_symbols = [c.get("trading_symbol") for c in data[:5]]
-                logger(f"WARN: Live API missed {symbol} {target_suffix} on {expiry_date_str}. Samples: {sample_symbols}")
-        elif logger:
-            logger(f"WARN: Live API Error {res.status_code} for {symbol} on {expiry_date_str}")
     else:
         api_type = "option" if inst_type == "OPTIDX" else "future"
         underlying = INDEX_CONFIG[symbol]["underlying"]
@@ -141,6 +120,8 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
         
         if res and res.status_code == 200:
             contracts = res.json().get("data", [])
+            found_strikes = []
+            
             for c in contracts:
                 tsym_raw = str(c.get("trading_symbol", ""))
                 if not is_exact_symbol(tsym_raw, symbol): continue
@@ -150,20 +131,18 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                 
                 if inst_type == "OPTIDX":
                     match = re.search(rf'(\d+(?:\.\d+)?)\s*{opt_type}', tsym_raw.upper())
-                    if match and float(match.group(1)) == float(strike):
-                        return c.get("instrument_key")
-                        
-            if logger:
-                sample_symbols = [c.get("trading_symbol") for c in contracts[:5]]
-                logger(f"WARN: Expired API missed {symbol} {target_suffix} on {expiry_date_str}. Contracts returned: {len(contracts)}. Samples: {sample_symbols}")
-        elif logger:
-            logger(f"WARN: Expired API Error {res.status_code} for {symbol} on {expiry_date_str}")
-                
+                    if match:
+                        found_strikes.append(float(match.group(1)))
+                        if float(match.group(1)) == float(strike):
+                            return c.get("instrument_key")
+                            
+            if logger and inst_type == "OPTIDX":
+                if found_strikes:
+                    logger(f"[DEBUG OPTION] Missed {strike}{opt_type} on {expiry_date_str}. Total contracts: {len(contracts)}. Found strikes range: {min(found_strikes)} to {max(found_strikes)}")
+                else:
+                    logger(f"[DEBUG OPTION] Missed {strike}{opt_type} on {expiry_date_str}. 0 valid strikes parsed. Sample raw symbols: {[c.get('trading_symbol') for c in contracts[:5]]}")
     return None
 
-# ==========================================
-# MODULE 3: DATA FETCHING & GITHUB CACHING
-# ==========================================
 def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1minute', logger=None):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     encoded_key = urllib.parse.quote(instrument_key)
@@ -174,8 +153,9 @@ def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1min
     all_candles = []
     current = start_dt
     
+    if logger: logger(f"[DEBUG FETCH] Initiating chunked download for {instrument_key} from {from_date} to {to_date}")
+    
     while current <= end_dt:
-        # CRITICAL FIX: 2-Day Chunks to bypass silent truncation
         chunk_end = min(current + timedelta(days=2), end_dt)
         str_from = current.strftime('%Y-%m-%d')
         str_to = chunk_end.strftime('%Y-%m-%d')
@@ -183,23 +163,28 @@ def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1min
         url_active = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{interval}/{str_to}/{str_from}"
         res = robust_api_get(url_active, headers)
         chunk_candles = []
+        source = "None"
         
         if res and res.status_code == 200:
             chunk_candles = res.json().get('data', {}).get('candles', [])
-        elif res and res.status_code != 200 and logger:
-            logger(f"API Error {res.status_code} fetching chunk {str_from} to {str_to}")
-            
-        if not chunk_candles:
+            source = "Active API"
+        else:
             url_expired = f"https://api.upstox.com/v2/expired-instruments/historical-candle/{encoded_key}/{interval}/{str_to}/{str_from}"
             res_exp = robust_api_get(url_expired, headers)
             if res_exp and res_exp.status_code == 200:
                 chunk_candles = res_exp.json().get('data', {}).get('candles', [])
+                source = "Expired API"
+            elif logger:
+                stat_active = res.status_code if res else "Fail"
+                stat_exp = res_exp.status_code if res_exp else "Fail"
+                logger(f"  -> [CHUNK FAILED] {str_from} to {str_to} | Active HTTP: {stat_active} | Expired HTTP: {stat_exp}")
                 
         if chunk_candles:
+            if logger: logger(f"  -> [CHUNK OK] {str_from} to {str_to} | {len(chunk_candles)} candles via {source}")
             all_candles.extend(chunk_candles)
             
         current = chunk_end + timedelta(days=1)
-        time.sleep(0.2) # CRITICAL FIX: Micro-delay prevents rate-limiting
+        time.sleep(0.3)
             
     if not all_candles: return pd.DataFrame()
     
@@ -211,63 +196,34 @@ def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1min
 def build_continuous_futures(symbol, start_date_str, token, github_repo="", logger=None):
     today_str = datetime.now(IST).strftime('%Y-%m-%d')
     start_dt = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-    all_expiries = get_all_expiries(symbol, token)
+    all_expiries = get_all_expiries(symbol, token, logger)
     
     if not all_expiries:
-        if logger: logger(f"CRITICAL: 0 expiries found for {symbol}. API might be down or key is wrong.")
+        if logger: logger(f"[CRITICAL] 0 total expiries mapped for {symbol}.")
         return pd.DataFrame(), [], False
+        
+    if logger: logger(f"[DEBUG] Found {len(all_expiries)} valid expiries. Proceeding to cache check...")
     
     if github_repo:
         raw_url = f"https://raw.githubusercontent.com/{github_repo}/main/data_cache/{symbol}_continuous.csv"
-        if logger: logger(f"Checking GitHub Cache: {raw_url}")
         try:
             res = requests.get(raw_url, timeout=15)
             if res.status_code == 200:
                 df = pd.read_csv(io.StringIO(res.text))
-                
-                if df.empty:
-                    if logger: logger("GitHub cache is empty. Forcing fresh API download...")
-                else:
+                if not df.empty:
                     df['timestamp'] = pd.to_datetime(df['timestamp'])
                     df.set_index('timestamp', inplace=True)
-                    
-                    if df.index.tz is not None:
-                        df.index = df.index.tz_localize(None)
+                    if df.index.tz is not None: df.index = df.index.tz_localize(None)
                     
                     if df.index.min() <= pd.to_datetime(start_date_str):
                         if df.index.max() >= pd.to_datetime(today_str) - timedelta(days=5):
                             df = df[df.index >= pd.to_datetime(start_date_str)]
-                            if not df.empty:
-                                if logger: logger(f"Successfully loaded {len(df)} rows from GitHub cache.")
-                                return df, all_expiries, False
-                        else:
-                            if logger: logger(f"GitHub cache is incomplete (ends on {df.index.max().date()}). Forcing fresh API download...")
-                    else:
-                        if logger: logger("GitHub cache exists but is too short. Forcing fresh API download...")
-        except Exception as e:
-            if logger: logger(f"GitHub cache load failed: {e}")
-
-    local_filename = f"{symbol}_continuous.csv"
-    if os.path.exists(local_filename):
-        df = pd.read_csv(local_filename)
-        if not df.empty:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df.set_index('timestamp', inplace=True)
-            if df.index.tz is not None:
-                df.index = df.index.tz_localize(None)
-                
-            if df.index.min() <= pd.to_datetime(start_date_str):
-                if df.index.max() >= pd.to_datetime(today_str) - timedelta(days=5):
-                    df = df[df.index >= pd.to_datetime(start_date_str)]
-                    if not df.empty:
-                        return df, all_expiries, False
+                            if not df.empty: return df, all_expiries, False
+        except Exception: pass
 
     if logger: logger(f"Fetching fresh data from Upstox API...")
     monthly_expiries = get_monthly_expiries(all_expiries)
     relevant_expiries = [e for e in monthly_expiries if datetime.strptime(e, '%Y-%m-%d').date() >= start_dt]
-    
-    if not relevant_expiries and logger:
-        logger(f"CRITICAL: 0 relevant expiries for {symbol} after {start_date_str}.")
     
     continuous_df = pd.DataFrame()
     current_start = start_date_str
@@ -275,31 +231,22 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
     for exp in relevant_expiries:
         future_key = resolve_exact_contract(symbol, exp, token, inst_type="FUTIDX", logger=logger)
         if not future_key: 
-            if logger: logger(f"WARN: Failed to resolve Future Key for {symbol} on expiry {exp}")
+            if logger: logger(f"[DEBUG FUTURE] Failed to resolve Future Key for {symbol} on {exp}")
             continue
-        
+            
         end_fetch = min(exp, today_str)
-        if logger: logger(f"Fetching futures chunk for {symbol}: {current_start} to {end_fetch}")
-        
         df = fetch_candle_chunk(future_key, current_start, end_fetch, token, logger=logger)
         
         if not df.empty:
             continuous_df = pd.concat([continuous_df, df])
         else:
-            if logger: logger(f"WARN: 0 candles returned for {symbol} chunk {current_start} to {end_fetch}")
+            if logger: logger(f"[DEBUG FUTURE] Returned 0 rows for chunk {current_start} to {end_fetch}")
             
         current_start = (datetime.strptime(exp, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
-        if current_start > today_str:
-            break
+        if current_start > today_str: break
             
     if not continuous_df.empty:
         continuous_df = continuous_df[~continuous_df.index.duplicated(keep='first')]
-        try:
-            continuous_df.to_csv(local_filename)
-        except: pass
-    elif logger:
-        logger(f"CRITICAL ERROR: The API returned 0 total futures rows for {symbol}. Continuous chart is empty.")
-        
     return continuous_df, all_expiries, True
 
 def get_specific_candle_close(instrument_key, target_dt_str, token):
@@ -318,13 +265,9 @@ def get_specific_candle_close(instrument_key, target_dt_str, token):
         candles = res.json().get("data", {}).get("candles", [])
         candles.sort(key=lambda x: x[0]) 
         for candle in candles:
-            if str(candle[0])[:16].replace('T', ' ') >= target_dt_str:
-                return float(candle[4])
+            if str(candle[0])[:16].replace('T', ' ') >= target_dt_str: return float(candle[4])
     return 0.0
 
-# ==========================================
-# MODULE 4: STRATEGY & SIMULATION
-# ==========================================
 def resample_timeframes(df_base, ltf_interval, htf_interval):
     agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'vol': 'sum'}
     ltf_df = df_base.resample(ltf_interval).agg(agg_dict).dropna()
@@ -367,10 +310,8 @@ def generate_signals(ltf, htf):
     df['htf_long_bias'] = (df['close'] > df['ema_25']) & (df['htf_stoch_k'] > df['htf_stoch_d']) & (df['obv'] > df['obv_sma_20'])
     df['htf_short_bias'] = (df['close'] < df['ema_25']) & (df['htf_stoch_k'] < df['htf_stoch_d']) & (df['obv'] < df['obv_sma_20'])
     
-    if 'vol' in df.columns:
-        df['vol_surge'] = (df['vol'] > df['vol'].shift(1)) & (df['vol'] > df['vol'].shift(2))
-    else:
-        df['vol_surge'] = False
+    if 'vol' in df.columns: df['vol_surge'] = (df['vol'] > df['vol'].shift(1)) & (df['vol'] > df['vol'].shift(2))
+    else: df['vol_surge'] = False
     
     df['long_signal'] = (df['close'] > df['open']) & df['stoch_cross_up'].shift(1).fillna(False) & df['vol_surge'] & df['htf_long_bias']
     df['short_signal'] = (df['close'] < df['open']) & df['stoch_cross_down'].shift(1).fillna(False) & df['vol_surge'] & df['htf_short_bias']
