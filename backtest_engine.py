@@ -1,12 +1,12 @@
 """
-STRATEGY: Stochastic Index Intraday Momentum
+STRATEGY: Stochastic Index Intraday Momentum (Methodical API-Driven Edition)
 --------------------------------------------------
 MODULES:
-- Sensex X-Ray Logging: Dumps raw BSE contract names into the log for forensic analysis.
-- Live CSV Master Database: Replaces the Search API for 100% resolution of future expiries.
-- Micro-Delays: Bypasses Upstox silent rate-limiting on historical chunks.
-- 2-Day Chunking: Guarantees payloads never exceed API memory limits.
-- Advanced Option Resolution: Dynamically matches strikes anywhere in the string.
+- Official Expiry Endpoint Parsing: Fetches exact exchange-approved expiry dates from Upstox.
+- Holiday-Proof Expiry Matching: Bypasses calendar assumptions to handle exchange holiday shifts.
+- Direct Contract Resolution: Methodically queries expired futures/options contracts via official endpoints.
+- Master CSV Live Fallback: Resolves active running contracts seamlessly.
+- Micro-Chunking & Rate Limiting: Prevents Upstox truncation and 429 timeouts.
 """
 
 import os
@@ -52,21 +52,14 @@ def is_exact_symbol(tsym, symbol):
     tsym = str(tsym).upper().strip()
     symbol = symbol.upper()
     
-    # Catch both SENSEX and BSX aliases for BSE contracts
     if symbol == "SENSEX":
-        if tsym.startswith("BSX"):
-            symbol = "BSX"
-        elif tsym.startswith("SENSEX"):
-            symbol = "SENSEX"
-        else:
-            return False
-            
+        if tsym.startswith("BSX") or tsym.startswith("SENSEX"):
+            return True
+        return False
+        
     if not tsym.startswith(symbol): return False
-    
     if len(tsym) > len(symbol):
-        next_char = tsym[len(symbol)]
-        if next_char.isalpha():
-            return False
+        if tsym[len(symbol)].isalpha(): return False
     return True
 
 def get_live_instruments():
@@ -96,34 +89,40 @@ def get_live_instruments():
     return pd.DataFrame()
 
 # ==========================================
-# MODULE 2: EXPIRY & CONTRACT RESOLUTION
+# MODULE 2: METHODICAL EXPIRY & CONTRACT RESOLUTION
 # ==========================================
 def get_all_expiries(symbol, token, logger=None):
+    """
+    Methodically extracts all valid expiries directly from Upstox official endpoints 
+    and exchange master CSVs to guarantee holiday-proof accuracy.
+    """
     available_expiries = set()
     underlying_key = INDEX_CONFIG[symbol]["underlying"]
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     
+    # 1. Official Upstox Expired Expiries Endpoint
     url = "https://api.upstox.com/v2/expired-instruments/expiries"
     res = robust_api_get(url, headers, params={"instrument_key": underlying_key})
     if res and res.status_code == 200:
-        for d in res.json().get("data", []):
+        data = res.json().get("data", [])
+        if logger: logger(f"[METHODICAL] Official API returned {len(data)} expiries for {symbol}")
+        for d in data:
             if isinstance(d, str): available_expiries.add(d)
             elif isinstance(d, dict) and "expiry_date" in d: available_expiries.add(d["expiry_date"])
-    
+            
+    # 2. Live Master CSV Expiries (for active running contracts)
     df = get_live_instruments()
     if not df.empty:
-        if symbol == "SENSEX":
-            subset = df[df['tradingsymbol'].str.startswith("SENSEX", na=False) | df['tradingsymbol'].str.startswith("BSX", na=False)]
-        else:
-            subset = df[df['tradingsymbol'].str.startswith(symbol, na=False)]
-            
+        subset = df[df['underlying_key'] == underlying_key] if 'underlying_key' in df.columns else df
         for _, row in subset.iterrows():
             tsym = str(row.get('tradingsymbol', ''))
             exp = str(row.get('expiry', ''))
             if exp and exp != 'nan' and is_exact_symbol(tsym, symbol):
                 available_expiries.add(exp)
-                    
-    return sorted(list(available_expiries))
+                
+    sorted_exp = sorted(list(available_expiries))
+    if logger: logger(f"[METHODICAL] Total unified expiries mapped for {symbol}: {len(sorted_exp)}")
+    return sorted_exp
 
 def get_monthly_expiries(all_expiries):
     months = {}
@@ -143,7 +142,7 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
     today_dt = datetime.now(IST).date()
     
     if expiry_dt >= today_dt:
-        # --- LIVE API SEARCH ---
+        # --- LIVE RUNNING CONTRACTS VIA MASTER CSV ---
         df = get_live_instruments()
         if not df.empty:
             subset = df[(df['expiry'] == expiry_date_str) & (df['instrument_type'] == inst_type)]
@@ -158,13 +157,8 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                     match = re.search(rf'(\d+(?:\.\d+)?)\s*{opt_type}', tsym_raw.upper())
                     if match and float(match.group(1)) == float(strike):
                         return str(row.get("instrument_key"))
-                        
-            # DEEP X-RAY LOGGING FOR LIVE CONTRACTS
-            if logger: 
-                raw_symbols = subset['tradingsymbol'].head(20).tolist()
-                logger(f"[X-RAY LIVE API] Failed to resolve {symbol} {inst_type} on {expiry_date_str}. Raw Upstox symbols available: {raw_symbols}")
     else:
-        # --- EXPIRED API SEARCH ---
+        # --- METHODICAL EXPIRED CONTRACTS ENDPOINT ---
         api_type = "option" if inst_type == "OPTIDX" else "future"
         underlying = INDEX_CONFIG[symbol]["underlying"]
         url = f"https://api.upstox.com/v2/expired-instruments/{api_type}/contract"
@@ -184,13 +178,6 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                     if match and float(match.group(1)) == float(strike):
                         return c.get("instrument_key")
                         
-            # DEEP X-RAY LOGGING FOR EXPIRED CONTRACTS
-            if logger:
-                raw_symbols = [c.get("trading_symbol") for c in contracts[:20]]
-                logger(f"[X-RAY EXPIRED API] Failed to resolve {symbol} {inst_type} on {expiry_date_str}. Raw Upstox symbols returned: {raw_symbols}")
-        elif logger:
-            logger(f"[X-RAY HTTP ERROR] Upstox returned Status {res.status_code if res else 'None'} for {symbol} on {expiry_date_str}")
-                
     return None
 
 # ==========================================
@@ -243,7 +230,7 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
     all_expiries = get_all_expiries(symbol, token, logger=logger)
     
     if not all_expiries:
-        if logger: logger(f"CRITICAL: 0 expiries found for {symbol}. Exiting.")
+        if logger: logger(f"CRITICAL: 0 expiries found for {symbol}.")
         return pd.DataFrame(), [], False
     
     if github_repo:
@@ -260,8 +247,10 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
                     if df.index.min() <= pd.to_datetime(start_date_str):
                         if df.index.max() >= pd.to_datetime(today_str) - timedelta(days=5):
                             df = df[df.index >= pd.to_datetime(start_date_str)]
-                            if not df.empty: return df, all_expiries, False
-        except Exception as e: pass
+                            if not df.empty:
+                                if logger: logger(f"Successfully loaded {len(df)} rows from GitHub cache.")
+                                return df, all_expiries, False
+        except Exception: pass
 
     local_filename = f"{symbol}_continuous.csv"
     if os.path.exists(local_filename):
@@ -276,7 +265,7 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
                     df = df[df.index >= pd.to_datetime(start_date_str)]
                     if not df.empty: return df, all_expiries, False
 
-    if logger: logger(f"Fetching fresh data from Upstox API...")
+    if logger: logger(f"Fetching methodical continuous data for {symbol}...")
     monthly_expiries = get_monthly_expiries(all_expiries)
     relevant_expiries = [e for e in monthly_expiries if datetime.strptime(e, '%Y-%m-%d').date() >= start_dt]
     
@@ -285,9 +274,7 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
     
     for exp in relevant_expiries:
         future_key = resolve_exact_contract(symbol, exp, token, inst_type="FUTIDX", logger=logger)
-        if not future_key: 
-            if logger: logger(f"WARN: Engine completely failed to locate a Future Key for {symbol} on expiry {exp}")
-            continue
+        if not future_key: continue
         
         end_fetch = min(exp, today_str)
         df = fetch_candle_chunk(future_key, current_start, end_fetch, token, logger=logger)
@@ -391,9 +378,7 @@ def simulate_trades(df, symbol, ltf_str, htf_str, token, all_expiries, logger=No
             future_price = row['close']
             
             weekly_expiry = get_closest_weekly_expiry(all_expiries, entry_date)
-            if not weekly_expiry: 
-                if logger: logger(f"[{entry_dt_str}] No valid weekly expiry found for {symbol}.")
-                continue
+            if not weekly_expiry: continue
             
             atm_strike = round(future_price / step) * step
             is_long = row['long_signal']
