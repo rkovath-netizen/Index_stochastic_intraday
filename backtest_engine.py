@@ -2,11 +2,11 @@
 STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
 MODULES:
-- Advanced Option Resolution: Dynamically matches strikes anywhere in the string to bypass weird Upstox date suffixes (e.g., 'NIFTY 12000 PE 30 JUN 26').
-- Unified Contract Mapping: Synchronizes search logic across both Live and Expired APIs.
-- Strict Symbol Matching: Hardened boundaries prevent NIFTYFIN/BANKNIFTY contamination.
-- GitHub/Local Caching: Validates completeness before loading to prevent 750-row gaps.
-- Timezone Normalization: Strips tz-aware metadata for smooth date comparisons.
+- Data Chunking: Splits large API requests into 5-day chunks to prevent Upstox truncation.
+- Sensex Alias Resolution: Automatically recognizes BSE's "BSX" naming convention.
+- Advanced Option Resolution: Dynamically matches strikes anywhere in the string.
+- Strict Symbol Matching: Hardened boundaries prevent NIFTYFIN contamination.
+- GitHub/Local Caching: Validates completeness before loading.
 - Precise Option OHLC Polling: Sorts candles chronologically.
 """
 
@@ -50,6 +50,11 @@ def robust_api_get(url, headers, max_retries=3, params=None):
 def is_exact_symbol(tsym, symbol):
     tsym = str(tsym).upper().strip()
     symbol = symbol.upper()
+    
+    # CRITICAL FIX: Handle Bombay Stock Exchange alias for Sensex
+    if symbol == "SENSEX" and tsym.startswith("BSX"):
+        symbol = "BSX"
+        
     if not tsym.startswith(symbol): return False
     
     if len(tsym) > len(symbol):
@@ -105,8 +110,8 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
     target_suffix = f"{int(strike)} {opt_type}" if inst_type == "OPTIDX" else "FUT"
     
     if expiry_dt >= today_dt:
-        # --- LIVE API SEARCH ---
         query = f"{symbol}"
+        if symbol == "SENSEX": query = "BSX" # Optimize live search for BSE
         if strike: query += f" {int(strike)}"
         search_params = {"query": query, "segments": segment, "instrument_types": inst_type if not opt_type else opt_type, "expiry": expiry_date_str}
         res = robust_api_get("https://api.upstox.com/v2/instruments/search", headers, params=search_params)
@@ -121,7 +126,6 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                     return c.get('instrument_key')
                     
                 if inst_type == "OPTIDX":
-                    # CRITICAL FIX: Match the strike + opt_type anywhere in the string to ignore date suffixes
                     match = re.search(rf'(\d+(?:\.\d+)?)\s*{opt_type}', tsym_raw.upper())
                     if match and float(match.group(1)) == float(strike):
                         return c.get("instrument_key")
@@ -130,7 +134,6 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                 sample_symbols = [c.get("trading_symbol") for c in data[:5]]
                 logger(f"WARN: Live API missed {symbol} {target_suffix} on {expiry_date_str}. Samples: {sample_symbols}")
     else:
-        # --- EXPIRED API SEARCH ---
         api_type = "option" if inst_type == "OPTIDX" else "future"
         underlying = INDEX_CONFIG[symbol]["underlying"]
         url = f"https://api.upstox.com/v2/expired-instruments/{api_type}/contract"
@@ -146,7 +149,6 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                     return c.get("instrument_key")
                 
                 if inst_type == "OPTIDX":
-                    # CRITICAL FIX: Match the strike + opt_type anywhere in the string
                     match = re.search(rf'(\d+(?:\.\d+)?)\s*{opt_type}', tsym_raw.upper())
                     if match and float(match.group(1)) == float(strike):
                         return c.get("instrument_key")
@@ -161,24 +163,45 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
 # MODULE 3: DATA FETCHING & GITHUB CACHING
 # ==========================================
 def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1minute'):
+    """
+    CRITICAL FIX: Fetches data in 5-day chunks to prevent the Upstox API 
+    from truncating large historical requests.
+    """
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     encoded_key = urllib.parse.quote(instrument_key)
     
-    url_active = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{interval}/{to_date}/{from_date}"
-    res = robust_api_get(url_active, headers)
-    candles = []
-    if res and res.status_code == 200:
-        candles = res.json().get('data', {}).get('candles', [])
-        
-    if not candles:
-        url_expired = f"https://api.upstox.com/v2/expired-instruments/historical-candle/{encoded_key}/{interval}/{to_date}/{from_date}"
-        res_exp = robust_api_get(url_expired, headers)
-        if res_exp and res_exp.status_code == 200:
-            candles = res_exp.json().get('data', {}).get('candles', [])
-            
-    if not candles: return pd.DataFrame()
+    start_dt = datetime.strptime(from_date, '%Y-%m-%d').date()
+    end_dt = datetime.strptime(to_date, '%Y-%m-%d').date()
     
-    df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol', 'oi'])
+    all_candles = []
+    current = start_dt
+    
+    while current <= end_dt:
+        chunk_end = min(current + timedelta(days=5), end_dt)
+        str_from = current.strftime('%Y-%m-%d')
+        str_to = chunk_end.strftime('%Y-%m-%d')
+        
+        url_active = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{interval}/{str_to}/{str_from}"
+        res = robust_api_get(url_active, headers)
+        chunk_candles = []
+        
+        if res and res.status_code == 200:
+            chunk_candles = res.json().get('data', {}).get('candles', [])
+            
+        if not chunk_candles:
+            url_expired = f"https://api.upstox.com/v2/expired-instruments/historical-candle/{encoded_key}/{interval}/{str_to}/{str_from}"
+            res_exp = robust_api_get(url_expired, headers)
+            if res_exp and res_exp.status_code == 200:
+                chunk_candles = res_exp.json().get('data', {}).get('candles', [])
+                
+        if chunk_candles:
+            all_candles.extend(chunk_candles)
+            
+        current = chunk_end + timedelta(days=1)
+            
+    if not all_candles: return pd.DataFrame()
+    
+    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol', 'oi'])
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df.set_index('timestamp', inplace=True)
     return df.sort_index().astype(float)
