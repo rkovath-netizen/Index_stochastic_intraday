@@ -80,8 +80,6 @@ if st.sidebar.button("Run Backtest", type="primary"):
     
     with st.status("🚀 Running Backtest Engine...", expanded=True) as status:
         for idx, symbol in enumerate(selected_instruments):
-            # CRITICAL FIX: The try/except is now INSIDE the loop. 
-            # If Sensex fails, it skips it and still saves Nifty!
             try:
                 st.markdown(f"### ⚙️ Processing: {symbol}")
                 start_date_str = (datetime.datetime.now(IST) - datetime.timedelta(days=days_to_fetch)).strftime('%Y-%m-%d')
@@ -120,21 +118,16 @@ if st.sidebar.button("Run Backtest", type="primary"):
                 st.error(f"❌ Error during execution for {symbol}:")
                 st.code(traceback.format_exc(), language="python")
                 st.warning(f"Skipping {symbol} and moving to the next step...")
-                continue # Skip this symbol, but keep running the app!
+                continue
                 
         status.update(label="✅ Backtest Operations Concluded!", state="complete", expanded=False)
             
     my_bar.empty() 
     
+    # --- DISPLAY & EXPORT RESULTS ---
     if not all_trades.empty:
-        st.success(f"[{get_time()}] Rendering results...")
+        st.success(f"[{get_time()}] Backtest successful. Preparing data...")
         metrics_df = calculate_portfolio_metrics(all_trades)
-        
-        st.subheader("Performance Metrics")
-        st.dataframe(metrics_df, use_container_width=True)
-        
-        st.subheader("Detailed Trade Log")
-        st.dataframe(all_trades, use_container_width=True)
         
         csv_trades_str = all_trades.to_csv(index=False)
         csv_metrics_str = metrics_df.to_csv(index=False)
@@ -143,16 +136,30 @@ if st.sidebar.button("Run Backtest", type="primary"):
         trades_filename = f"stochastic_momentum_trades_{timestamp}.csv"
         metrics_filename = f"stochastic_momentum_metrics_{timestamp}.csv"
         
-        col1, col2 = st.columns(2)
-        col1.download_button("📥 Download Trade Log", data=csv_trades_str.encode('utf-8'), file_name=trades_filename, mime='text/csv', use_container_width=True)
-        col2.download_button("📥 Download Metrics", data=csv_metrics_str.encode('utf-8'), file_name=metrics_filename, mime='text/csv', use_container_width=True)
-        
+        # 1. INSTANT GITHUB PUSH (Protects against mobile refreshes)
         if github_repo and github_token:
-            with st.spinner("☁️ Auto-pushing trade results to GitHub repository..."):
+            with st.spinner("☁️ Securing data to GitHub..."):
                 t_success = push_csv_to_github(csv_trades_str, f"backtest_results/{trades_filename}", github_repo)
                 m_success = push_csv_to_github(csv_metrics_str, f"backtest_results/{metrics_filename}", github_repo)
                 
                 if t_success and m_success:
-                    st.success("✅ Results safely pushed to your GitHub repository folder: /backtest_results/")
+                    st.success(f"✅ Data instantly secured! You can safely close this page. Files are in your GitHub repo under `/backtest_results/`")
+                else:
+                    st.warning("GitHub auto-push failed. Please use the manual download buttons below.")
+        
+        # 2. RENDER UI
+        st.subheader("Performance Metrics")
+        st.dataframe(metrics_df, use_container_width=True)
+        
+        st.subheader("Detailed Trade Log")
+        st.dataframe(all_trades, use_container_width=True)
+        
+        # 3. MANUAL DOWNLOAD BUTTONS
+        st.divider()
+        st.subheader("💾 Export Options")
+        col1, col2 = st.columns(2)
+        col1.download_button("📥 Download Trade Log", data=csv_trades_str.encode('utf-8'), file_name=trades_filename, mime='text/csv', use_container_width=True)
+        col2.download_button("📥 Download Metrics", data=csv_metrics_str.encode('utf-8'), file_name=metrics_filename, mime='text/csv', use_container_width=True)
+
     else:
-        st.warning(f"[{get_time()}] Execution finished, but no trades were generated.")
+        st.warning(f"[{get_time()}] Execution finished, but no trades were generated based on your strategy conditions.")
