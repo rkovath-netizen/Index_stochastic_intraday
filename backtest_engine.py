@@ -2,12 +2,12 @@
 STRATEGY: Stochastic Index Intraday Momentum (Methodical API-Driven Edition)
 --------------------------------------------------
 MODULES:
+- Explicit Instrument Verification: Logs exact Trading Symbol and Key to verify BSE_FO mapping.
 - Automatic Timeframe Fallback: Dynamically scales from 1-min -> 3-min -> 5-min if futures are illiquid.
-- Transparent Data Logging: Exposes Upstox API empty responses for illiquid BSE Futures.
+- Transparent Data Logging: Exposes Upstox API empty responses.
 - Official Expiry Endpoint Parsing: Fetches exact exchange-approved expiry dates from Upstox.
 - Direct Contract Resolution: Methodically queries expired futures/options contracts via official endpoints.
 - Master CSV Live Fallback: Resolves active running contracts seamlessly.
-- Micro-Chunking & Rate Limiting: Prevents Upstox truncation and 429 timeouts.
 """
 
 import os
@@ -34,6 +34,7 @@ TIMEFRAME_COMBOS = [
     ('10min', '60min')
 ]
 
+# Explicitly maps SENSEX to the BSE_FO segment to prevent NSE contamination
 INDEX_CONFIG = {
     "NIFTY": {"underlying": "NSE_INDEX|Nifty 50", "step": 50, "segment": "NSE_FO"},
     "SENSEX": {"underlying": "BSE_INDEX|SENSEX", "step": 100, "segment": "BSE_FO"}
@@ -140,18 +141,25 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
         # --- LIVE RUNNING CONTRACTS VIA MASTER CSV ---
         df = get_live_instruments()
         if not df.empty:
-            subset = df[(df['expiry'] == expiry_date_str) & (df['instrument_type'] == inst_type)]
+            # We strictly enforce the segment from INDEX_CONFIG to ensure we don't cross NSE/BSE boundaries
+            segment = INDEX_CONFIG[symbol]["segment"]
+            subset = df[(df['expiry'] == expiry_date_str) & (df['instrument_type'] == inst_type) & (df['exchange'] == segment)]
+            
             for _, row in subset.iterrows():
                 tsym_raw = str(row.get('tradingsymbol', ''))
                 if not is_exact_symbol(tsym_raw, symbol): continue
                 
+                inst_key = str(row.get('instrument_key'))
+                
                 if inst_type == "FUTIDX":
-                    return str(row.get('instrument_key'))
+                    if logger: logger(f"✅ [LIVE FUT RESOLVED] {symbol} -> {tsym_raw} | Key: {inst_key}")
+                    return inst_key
                 
                 if inst_type == "OPTIDX":
                     match = re.search(rf'(\d+(?:\.\d+)?)\s*{opt_type}', tsym_raw.upper())
                     if match and float(match.group(1)) == float(strike):
-                        return str(row.get("instrument_key"))
+                        if logger: logger(f"✅ [LIVE OPT RESOLVED] {symbol} {strike}{opt_type} -> {tsym_raw} | Key: {inst_key}")
+                        return inst_key
     else:
         # --- METHODICAL EXPIRED CONTRACTS ENDPOINT ---
         api_type = "option" if inst_type == "OPTIDX" else "future"
@@ -165,13 +173,17 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
                 tsym_raw = str(c.get("trading_symbol", ""))
                 if not is_exact_symbol(tsym_raw, symbol): continue
                 
+                inst_key = c.get("instrument_key")
+                
                 if inst_type == "FUTIDX":
-                    return c.get("instrument_key")
+                    if logger: logger(f"✅ [EXPIRED FUT RESOLVED] {symbol} -> {tsym_raw} | Key: {inst_key}")
+                    return inst_key
                 
                 if inst_type == "OPTIDX":
                     match = re.search(rf'(\d+(?:\.\d+)?)\s*{opt_type}', tsym_raw.upper())
                     if match and float(match.group(1)) == float(strike):
-                        return c.get("instrument_key")
+                        if logger: logger(f"✅ [EXPIRED OPT RESOLVED] {symbol} {strike}{opt_type} -> {tsym_raw} | Key: {inst_key}")
+                        return inst_key
                         
     return None
 
@@ -274,11 +286,9 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
             continue
         
         end_fetch = min(exp, today_str)
-        if logger: logger(f"Fetching Upstox 1-min data for {symbol} Future Key: {future_key} ({current_start} to {end_fetch})")
         
         df = fetch_candle_chunk(future_key, current_start, end_fetch, token, interval='1minute', logger=logger)
         
-        # --- AUTOMATIC TIMEFRAME FALLBACK FOR ILLIQUID CONTRACTS ---
         if df.empty:
             if logger: logger(f"⚠️ 1-min empty for {future_key}. Falling back to 3-min candles...")
             df = fetch_candle_chunk(future_key, current_start, end_fetch, token, interval='3minute', logger=logger)
