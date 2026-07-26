@@ -2,13 +2,12 @@
 STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
 MODULES:
+- Advanced Option Resolution: Dynamically matches strikes anywhere in the string to bypass weird Upstox date suffixes (e.g., 'NIFTY 12000 PE 30 JUN 26').
+- Unified Contract Mapping: Synchronizes search logic across both Live and Expired APIs.
 - Strict Symbol Matching: Hardened boundaries prevent NIFTYFIN/BANKNIFTY contamination.
-- GitHub/Local Caching: Checks for CSV files on GitHub to bypass API timeouts.
-- Cache Validation: Prevents loading corrupted/incomplete cache files from previous crashes.
+- GitHub/Local Caching: Validates completeness before loading to prevent 750-row gaps.
 - Timezone Normalization: Strips tz-aware metadata for smooth date comparisons.
-- Advanced Option Resolution: Uses Regex to mathematically match strikes, ignoring ".00" decimals.
 - Precise Option OHLC Polling: Sorts candles chronologically.
-- Safety Catch: Gracefully handles missing data to prevent KeyErrors.
 """
 
 import os
@@ -49,10 +48,6 @@ def robust_api_get(url, headers, max_retries=3, params=None):
     return res
 
 def is_exact_symbol(tsym, symbol):
-    """
-    Ensures 'NIFTY' only matches NIFTY, and prevents it from matching 'NIFTYFIN' 
-    or 'NIFTYMIDSELECT' by checking the boundary character.
-    """
     tsym = str(tsym).upper().strip()
     symbol = symbol.upper()
     if not tsym.startswith(symbol): return False
@@ -107,19 +102,35 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
     expiry_dt = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
     today_dt = datetime.now(IST).date()
     segment = INDEX_CONFIG[symbol]["segment"]
+    target_suffix = f"{int(strike)} {opt_type}" if inst_type == "OPTIDX" else "FUT"
     
     if expiry_dt >= today_dt:
+        # --- LIVE API SEARCH ---
         query = f"{symbol}"
         if strike: query += f" {int(strike)}"
         search_params = {"query": query, "segments": segment, "instrument_types": inst_type if not opt_type else opt_type, "expiry": expiry_date_str}
         res = robust_api_get("https://api.upstox.com/v2/instruments/search", headers, params=search_params)
+        
         if res and res.status_code == 200:
             data = res.json().get('data', [])
             for c in data:
                 tsym_raw = str(c.get("trading_symbol", ""))
-                if is_exact_symbol(tsym_raw, symbol):
+                if not is_exact_symbol(tsym_raw, symbol): continue
+                
+                if inst_type == "FUTIDX":
                     return c.get('instrument_key')
+                    
+                if inst_type == "OPTIDX":
+                    # CRITICAL FIX: Match the strike + opt_type anywhere in the string to ignore date suffixes
+                    match = re.search(rf'(\d+(?:\.\d+)?)\s*{opt_type}', tsym_raw.upper())
+                    if match and float(match.group(1)) == float(strike):
+                        return c.get("instrument_key")
+                        
+            if logger: 
+                sample_symbols = [c.get("trading_symbol") for c in data[:5]]
+                logger(f"WARN: Live API missed {symbol} {target_suffix} on {expiry_date_str}. Samples: {sample_symbols}")
     else:
+        # --- EXPIRED API SEARCH ---
         api_type = "option" if inst_type == "OPTIDX" else "future"
         underlying = INDEX_CONFIG[symbol]["underlying"]
         url = f"https://api.upstox.com/v2/expired-instruments/{api_type}/contract"
@@ -127,29 +138,23 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
         
         if res and res.status_code == 200:
             contracts = res.json().get("data", [])
-            
             for c in contracts:
                 tsym_raw = str(c.get("trading_symbol", ""))
-                
-                # STRICT BOUNDARY: Prevent contamination
-                if not is_exact_symbol(tsym_raw, symbol):
-                    continue
+                if not is_exact_symbol(tsym_raw, symbol): continue
                 
                 if inst_type == "FUTIDX":
                     return c.get("instrument_key")
                 
-                # CRITICAL FIX: Regex Mathematical Strike Matching
                 if inst_type == "OPTIDX":
-                    tsym_clean = tsym_raw.upper().replace(" ", "")
-                    if tsym_clean.endswith(opt_type):
-                        # Extracts the number (e.g. 23900 or 23900.00) from the end of the string
-                        match = re.search(r'(\d+(?:\.\d+)?)(?:CE|PE)$', tsym_clean)
-                        if match and float(match.group(1)) == float(strike):
-                            return c.get("instrument_key")
-                            
-            if logger and inst_type == "OPTIDX":
+                    # CRITICAL FIX: Match the strike + opt_type anywhere in the string
+                    match = re.search(rf'(\d+(?:\.\d+)?)\s*{opt_type}', tsym_raw.upper())
+                    if match and float(match.group(1)) == float(strike):
+                        return c.get("instrument_key")
+                        
+            if logger:
                 sample_symbols = [c.get("trading_symbol") for c in contracts[:5]]
-                logger(f"WARN: Could not match option for {symbol} {strike}{opt_type} on {expiry_date_str}. API returned {len(contracts)} contracts. Sample symbols: {sample_symbols}")
+                logger(f"WARN: Expired API missed {symbol} {target_suffix} on {expiry_date_str}. Samples: {sample_symbols}")
+                
     return None
 
 # ==========================================
@@ -201,15 +206,11 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
                         df.index = df.index.tz_localize(None)
                     
                     if df.index.min() <= pd.to_datetime(start_date_str):
-                        # CRITICAL FIX: Validate that the cache isn't an incomplete chunk from a previous crash
                         if df.index.max() >= pd.to_datetime(today_str) - timedelta(days=5):
                             df = df[df.index >= pd.to_datetime(start_date_str)]
-                            
                             if not df.empty:
                                 if logger: logger(f"Successfully loaded {len(df)} rows from GitHub cache.")
                                 return df, all_expiries, False
-                            else:
-                                if logger: logger("Filtered cache resulted in 0 rows. Forcing fresh API download...")
                         else:
                             if logger: logger(f"GitHub cache is incomplete (ends on {df.index.max().date()}). Forcing fresh API download...")
                     else:
