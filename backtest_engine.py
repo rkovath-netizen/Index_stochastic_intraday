@@ -2,8 +2,9 @@
 STRATEGY: Stochastic Index Intraday Momentum (Methodical API-Driven Edition)
 --------------------------------------------------
 MODULES:
+- Automatic Timeframe Fallback: Dynamically scales from 1-min -> 3-min -> 5-min if futures are illiquid.
+- Transparent Data Logging: Exposes Upstox API empty responses for illiquid BSE Futures.
 - Official Expiry Endpoint Parsing: Fetches exact exchange-approved expiry dates from Upstox.
-- Holiday-Proof Expiry Matching: Bypasses calendar assumptions to handle exchange holiday shifts.
 - Direct Contract Resolution: Methodically queries expired futures/options contracts via official endpoints.
 - Master CSV Live Fallback: Resolves active running contracts seamlessly.
 - Micro-Chunking & Rate Limiting: Prevents Upstox truncation and 429 timeouts.
@@ -92,15 +93,10 @@ def get_live_instruments():
 # MODULE 2: METHODICAL EXPIRY & CONTRACT RESOLUTION
 # ==========================================
 def get_all_expiries(symbol, token, logger=None):
-    """
-    Methodically extracts all valid expiries directly from Upstox official endpoints 
-    and exchange master CSVs to guarantee holiday-proof accuracy.
-    """
     available_expiries = set()
     underlying_key = INDEX_CONFIG[symbol]["underlying"]
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     
-    # 1. Official Upstox Expired Expiries Endpoint
     url = "https://api.upstox.com/v2/expired-instruments/expiries"
     res = robust_api_get(url, headers, params={"instrument_key": underlying_key})
     if res and res.status_code == 200:
@@ -110,7 +106,6 @@ def get_all_expiries(symbol, token, logger=None):
             if isinstance(d, str): available_expiries.add(d)
             elif isinstance(d, dict) and "expiry_date" in d: available_expiries.add(d["expiry_date"])
             
-    # 2. Live Master CSV Expiries (for active running contracts)
     df = get_live_instruments()
     if not df.empty:
         subset = df[df['underlying_key'] == underlying_key] if 'underlying_key' in df.columns else df
@@ -274,13 +269,28 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
     
     for exp in relevant_expiries:
         future_key = resolve_exact_contract(symbol, exp, token, inst_type="FUTIDX", logger=logger)
-        if not future_key: continue
+        if not future_key: 
+            if logger: logger(f"WARN: Failed to locate Future Key for {symbol} on expiry {exp}")
+            continue
         
         end_fetch = min(exp, today_str)
-        df = fetch_candle_chunk(future_key, current_start, end_fetch, token, logger=logger)
+        if logger: logger(f"Fetching Upstox 1-min data for {symbol} Future Key: {future_key} ({current_start} to {end_fetch})")
+        
+        df = fetch_candle_chunk(future_key, current_start, end_fetch, token, interval='1minute', logger=logger)
+        
+        # --- AUTOMATIC TIMEFRAME FALLBACK FOR ILLIQUID CONTRACTS ---
+        if df.empty:
+            if logger: logger(f"⚠️ 1-min empty for {future_key}. Falling back to 3-min candles...")
+            df = fetch_candle_chunk(future_key, current_start, end_fetch, token, interval='3minute', logger=logger)
+            
+        if df.empty:
+            if logger: logger(f"⚠️ 3-min empty for {future_key}. Falling back to 5-min candles...")
+            df = fetch_candle_chunk(future_key, current_start, end_fetch, token, interval='5minute', logger=logger)
         
         if not df.empty:
             continuous_df = pd.concat([continuous_df, df])
+        else:
+            if logger: logger(f"⚠️ UPSTOX DATA LIMIT: 0 historical candles returned for {future_key} across all intraday timeframes.")
             
         current_start = (datetime.strptime(exp, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
         if current_start > today_str: break
@@ -378,7 +388,9 @@ def simulate_trades(df, symbol, ltf_str, htf_str, token, all_expiries, logger=No
             future_price = row['close']
             
             weekly_expiry = get_closest_weekly_expiry(all_expiries, entry_date)
-            if not weekly_expiry: continue
+            if not weekly_expiry: 
+                if logger: logger(f"[{entry_dt_str}] No valid weekly expiry found for {symbol}.")
+                continue
             
             atm_strike = round(future_price / step) * step
             is_long = row['long_signal']
