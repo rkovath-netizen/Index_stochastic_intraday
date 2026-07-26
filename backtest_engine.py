@@ -3,10 +3,11 @@ STRATEGY: Stochastic Index Intraday Momentum
 --------------------------------------------------
 MODULES:
 - GitHub/Local Caching: Checks for CSV files on GitHub to bypass API timeouts.
-- Continuous Futures Builder: Stitches front-month futures history.
+- Timezone Normalization: Strips tz-aware metadata for smooth date comparisons.
 - Strict Expiry Matching: Prevents FINNIFTY/BANKNIFTY contamination.
+- Robust Options Resolution: Safely ignores spaces in historical Upstox symbols.
 - Precise Option OHLC Polling: Sorts candles chronologically.
-- Advanced Logging: Captures debug data for options resolution.
+- Safety Catch: Gracefully handles missing data to prevent KeyErrors.
 """
 
 import os
@@ -19,6 +20,7 @@ import gzip
 import csv
 import io
 import time
+import re
 import pytz
 
 # ==========================================
@@ -106,13 +108,12 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
         
         if res and res.status_code == 200:
             contracts = res.json().get("data", [])
-            
-            # Robust text matching instead of regex
             target_suffix = f"{int(strike)}{opt_type}" if inst_type == "OPTIDX" else "FUT"
             
             for c in contracts:
-                tsym = c.get("trading_symbol", "").upper()
-                if tsym.startswith(symbol) and tsym.endswith(target_suffix):
+                # FIX: Strip all spaces to match older Upstox formatting variants
+                tsym_clean = str(c.get("trading_symbol", "")).upper().replace(" ", "")
+                if tsym_clean.startswith(symbol) and tsym_clean.endswith(target_suffix):
                     return c.get("instrument_key")
                     
             if logger and inst_type == "OPTIDX":
@@ -154,16 +155,22 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
         raw_url = f"https://raw.githubusercontent.com/{github_repo}/main/data_cache/{symbol}_continuous.csv"
         if logger: logger(f"Checking GitHub Cache: {raw_url}")
         try:
-            res = requests.get(raw_url, timeout=10)
+            res = requests.get(raw_url, timeout=15)
             if res.status_code == 200:
                 df = pd.read_csv(io.StringIO(res.text))
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
                 df.set_index('timestamp', inplace=True)
                 
+                # CRITICAL FIX: Strip timezone awareness from the index before comparing
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None)
+                
                 if df.index.min() <= pd.to_datetime(start_date_str):
                     df = df[df.index >= pd.to_datetime(start_date_str)]
                     if logger: logger(f"Successfully loaded {len(df)} rows from GitHub cache.")
                     return df, all_expiries, False
+                else:
+                    if logger: logger(f"GitHub cache exists but is too short. Rebuilding via API.")
         except Exception as e:
             if logger: logger(f"GitHub cache load failed: {e}")
 
@@ -172,6 +179,11 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo="", logg
         df = pd.read_csv(local_filename)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
+        
+        # CRITICAL FIX: Strip timezone awareness
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+            
         if df.index.min() <= pd.to_datetime(start_date_str):
             df = df[df.index >= pd.to_datetime(start_date_str)]
             return df, all_expiries, False
