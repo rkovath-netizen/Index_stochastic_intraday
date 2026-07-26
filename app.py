@@ -19,11 +19,14 @@ from backtest_engine import (
 
 IST = pytz.timezone('Asia/Kolkata')
 
+# --- GITHUB PUSH FUNCTION ---
 def push_csv_to_github(csv_string, filename, repo_path):
     try:
         github_token = st.secrets.get("GITHUB_TOKEN", "")
         if not github_token:
+            st.error("❌ Secret missing: 'GITHUB_TOKEN' is not in Streamlit Secrets.")
             return False
+            
         g = Github(github_token)
         repo = g.get_repo(repo_path)
         
@@ -35,7 +38,8 @@ def push_csv_to_github(csv_string, filename, repo_path):
             
         return True
     except Exception as e:
-        print(f"GitHub push failed for {filename}: {e}")
+        # This will display the exact rejection reason on your screen
+        st.error(f"❌ GitHub API Error for {filename}: {e}")
         return False
 
 st.set_page_config(page_title="Stochastic Momentum Backtester", layout="wide")
@@ -136,7 +140,7 @@ if st.sidebar.button("Run Backtest", type="primary"):
         trades_filename = f"stochastic_momentum_trades_{timestamp}.csv"
         metrics_filename = f"stochastic_momentum_metrics_{timestamp}.csv"
         
-        # 1. INSTANT GITHUB PUSH (Protects against mobile refreshes)
+        # 1. INSTANT GITHUB PUSH
         if github_repo and github_token:
             with st.spinner("☁️ Securing data to GitHub..."):
                 t_success = push_csv_to_github(csv_trades_str, f"backtest_results/{trades_filename}", github_repo)
@@ -145,7 +149,7 @@ if st.sidebar.button("Run Backtest", type="primary"):
                 if t_success and m_success:
                     st.success(f"✅ Data instantly secured! You can safely close this page. Files are in your GitHub repo under `/backtest_results/`")
                 else:
-                    st.warning("GitHub auto-push failed. Please use the manual download buttons below.")
+                    st.warning("GitHub auto-push failed. Please check the error message above and use the manual download buttons below.")
         
         # 2. RENDER UI
         st.subheader("Performance Metrics")
