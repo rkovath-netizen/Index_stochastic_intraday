@@ -5,8 +5,8 @@ MODULES:
 - GitHub/Local Caching: Checks for CSV files on GitHub to bypass API timeouts.
 - Continuous Futures Builder: Stitches front-month futures history.
 - Strict Expiry Matching: Prevents FINNIFTY/BANKNIFTY contamination.
-- Precise Option OHLC Polling: Sorts candles chronologically to grab exact minute pricing.
-- Safety Catch: Gracefully handles missing data to prevent KeyErrors.
+- Precise Option OHLC Polling: Sorts candles chronologically.
+- Advanced Logging: Captures debug data for options resolution.
 """
 
 import os
@@ -19,7 +19,6 @@ import gzip
 import csv
 import io
 import time
-import re
 import pytz
 
 # ==========================================
@@ -85,7 +84,7 @@ def get_closest_weekly_expiry(all_expiries, target_date_str):
     valid_dates = [d for d in all_expiries if d >= target_date_str]
     return valid_dates[0] if valid_dates else None
 
-def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", strike=None, opt_type=None):
+def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", strike=None, opt_type=None, logger=None):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     expiry_dt = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
     today_dt = datetime.now(IST).date()
@@ -104,15 +103,20 @@ def resolve_exact_contract(symbol, expiry_date_str, token, inst_type="FUTIDX", s
         underlying = INDEX_CONFIG[symbol]["underlying"]
         url = f"https://api.upstox.com/v2/expired-instruments/{api_type}/contract"
         res = robust_api_get(url, headers, params={"instrument_key": underlying, "expiry_date": expiry_date_str})
+        
         if res and res.status_code == 200:
-            for c in res.json().get("data", []):
+            contracts = res.json().get("data", [])
+            
+            # Robust text matching instead of regex
+            target_suffix = f"{int(strike)}{opt_type}" if inst_type == "OPTIDX" else "FUT"
+            
+            for c in contracts:
                 tsym = c.get("trading_symbol", "").upper()
-                if inst_type == "FUTIDX" and "FUT" in tsym:
+                if tsym.startswith(symbol) and tsym.endswith(target_suffix):
                     return c.get("instrument_key")
-                elif inst_type == "OPTIDX" and opt_type in tsym:
-                    match = re.search(r'(\d+(\.\d+)?)(CE|PE)$', tsym)
-                    if match and float(match.group(1)) == float(strike):
-                        return c.get("instrument_key")
+                    
+            if logger and inst_type == "OPTIDX":
+                logger(f"WARN: Could not match option for {symbol} {target_suffix} on {expiry_date_str}. Total contracts returned: {len(contracts)}")
     return None
 
 # ==========================================
@@ -141,32 +145,30 @@ def fetch_candle_chunk(instrument_key, from_date, to_date, token, interval='1min
     df.set_index('timestamp', inplace=True)
     return df.sort_index().astype(float)
 
-def build_continuous_futures(symbol, start_date_str, token, github_repo=""):
+def build_continuous_futures(symbol, start_date_str, token, github_repo="", logger=None):
     today_str = datetime.now(IST).strftime('%Y-%m-%d')
     start_dt = datetime.strptime(start_date_str, '%Y-%m-%d').date()
     all_expiries = get_all_expiries(symbol, token)
     
     if github_repo:
         raw_url = f"https://raw.githubusercontent.com/{github_repo}/main/data_cache/{symbol}_continuous.csv"
-        print(f"[ENGINE] Checking GitHub Cache: {raw_url}")
+        if logger: logger(f"Checking GitHub Cache: {raw_url}")
         try:
             res = requests.get(raw_url, timeout=10)
             if res.status_code == 200:
-                print("[ENGINE] Found data on GitHub! Downloading direct...")
                 df = pd.read_csv(io.StringIO(res.text))
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
                 df.set_index('timestamp', inplace=True)
                 
                 if df.index.min() <= pd.to_datetime(start_date_str):
                     df = df[df.index >= pd.to_datetime(start_date_str)]
-                    print(f"[ENGINE] Successfully loaded {len(df)} rows from GitHub cache.")
+                    if logger: logger(f"Successfully loaded {len(df)} rows from GitHub cache.")
                     return df, all_expiries, False
         except Exception as e:
-            print(f"[ENGINE] GitHub cache load failed: {e}")
+            if logger: logger(f"GitHub cache load failed: {e}")
 
     local_filename = f"{symbol}_continuous.csv"
     if os.path.exists(local_filename):
-        print(f"[ENGINE] Loading local cache: {local_filename}")
         df = pd.read_csv(local_filename)
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df.set_index('timestamp', inplace=True)
@@ -174,7 +176,7 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo=""):
             df = df[df.index >= pd.to_datetime(start_date_str)]
             return df, all_expiries, False
 
-    print(f"[ENGINE] Fetching fresh data from Upstox API...")
+    if logger: logger(f"Fetching fresh data from Upstox API...")
     monthly_expiries = get_monthly_expiries(all_expiries)
     relevant_expiries = [e for e in monthly_expiries if datetime.strptime(e, '%Y-%m-%d').date() >= start_dt]
     
@@ -182,7 +184,7 @@ def build_continuous_futures(symbol, start_date_str, token, github_repo=""):
     current_start = start_date_str
     
     for exp in relevant_expiries:
-        future_key = resolve_exact_contract(symbol, exp, token, inst_type="FUTIDX")
+        future_key = resolve_exact_contract(symbol, exp, token, inst_type="FUTIDX", logger=logger)
         if not future_key: continue
         
         end_fetch = min(exp, today_str)
@@ -254,17 +256,13 @@ def calculate_strategy_indicators(ltf, htf):
     return ltf, htf
 
 def generate_signals(ltf, htf):
-    # --- SAFETY CATCH: Prevent KeyErrors if indicators failed to calculate ---
     required_htf_cols = ['ema_25', 'htf_stoch_k', 'htf_stoch_d', 'obv', 'obv_sma_20']
     for col in required_htf_cols:
-        if col not in htf.columns:
-            htf[col] = 0.0  # Fallback to prevent crash
+        if col not in htf.columns: htf[col] = 0.0
             
     required_ltf_cols = ['stoch_cross_up', 'stoch_cross_down']
     for col in required_ltf_cols:
-        if col not in ltf.columns:
-            ltf[col] = False # Fallback to prevent crash
-    # -------------------------------------------------------------------------
+        if col not in ltf.columns: ltf[col] = False
 
     htf_aligned = htf[[c for c in required_htf_cols if c in htf.columns]].reindex(ltf.index, method='ffill').fillna(0)
     df = ltf.join(htf_aligned)
@@ -272,7 +270,6 @@ def generate_signals(ltf, htf):
     df['htf_long_bias'] = (df['close'] > df['ema_25']) & (df['htf_stoch_k'] > df['htf_stoch_d']) & (df['obv'] > df['obv_sma_20'])
     df['htf_short_bias'] = (df['close'] < df['ema_25']) & (df['htf_stoch_k'] < df['htf_stoch_d']) & (df['obv'] < df['obv_sma_20'])
     
-    # Safely calculate volume surge
     if 'vol' in df.columns:
         df['vol_surge'] = (df['vol'] > df['vol'].shift(1)) & (df['vol'] > df['vol'].shift(2))
     else:
@@ -283,7 +280,7 @@ def generate_signals(ltf, htf):
         
     return df.dropna()
 
-def simulate_trades(df, symbol, ltf_str, htf_str, token, all_expiries):
+def simulate_trades(df, symbol, ltf_str, htf_str, token, all_expiries, logger=None):
     trades = []
     step = INDEX_CONFIG[symbol]["step"]
     
@@ -294,7 +291,9 @@ def simulate_trades(df, symbol, ltf_str, htf_str, token, all_expiries):
             future_price = row['close']
             
             weekly_expiry = get_closest_weekly_expiry(all_expiries, entry_date)
-            if not weekly_expiry: continue
+            if not weekly_expiry: 
+                if logger: logger(f"[{entry_dt_str}] No valid weekly expiry found for {symbol}.")
+                continue
             
             atm_strike = round(future_price / step) * step
             is_long = row['long_signal']
@@ -302,8 +301,8 @@ def simulate_trades(df, symbol, ltf_str, htf_str, token, all_expiries):
             opt_type = 'PE' if is_long else 'CE'
             otm2_strike = atm_strike - (step * 2) if is_long else atm_strike + (step * 2)
             
-            sell_leg_key = resolve_exact_contract(symbol, weekly_expiry, token, inst_type="OPTIDX", strike=atm_strike, opt_type=opt_type)
-            buy_leg_key = resolve_exact_contract(symbol, weekly_expiry, token, inst_type="OPTIDX", strike=otm2_strike, opt_type=opt_type)
+            sell_leg_key = resolve_exact_contract(symbol, weekly_expiry, token, inst_type="OPTIDX", strike=atm_strike, opt_type=opt_type, logger=logger)
+            buy_leg_key = resolve_exact_contract(symbol, weekly_expiry, token, inst_type="OPTIDX", strike=otm2_strike, opt_type=opt_type, logger=logger)
             
             sell_price = round(get_specific_candle_close(sell_leg_key, entry_dt_str, token), 2) if sell_leg_key else 0.0
             buy_price = round(get_specific_candle_close(buy_leg_key, entry_dt_str, token), 2) if buy_leg_key else 0.0
